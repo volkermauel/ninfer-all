@@ -313,8 +313,10 @@ struct Executor::Impl {
         stream = device.stream;
         const int device_id = device.rank(0).device;
         kvfmt = kv_format(o.kv_cache);
-        growing = !model.expert_banks().empty() && !options.expert_cache_bytes &&
-                  vmm::granularity(device_id) != 0;
+        // The full-attention planes back through VMM as their sequences reach them: granules
+        // trade against the expert delivery cache (host or disk residency) or free VRAM (device
+        // residency). An explicit expert cache fixes the trade.
+        growing = !options.expert_cache_bytes && vmm::granularity(device_id) != 0;
         hidden      = int(config.hidden_size);
         query_heads = int(config.num_attention_heads);
         kv_heads    = int(config.num_key_value_heads);
@@ -388,15 +390,40 @@ struct Executor::Impl {
                                                          spine_options());
             }
             if (options.dspark) { needed += spark_planned_bytes(); }
+            const std::size_t plan = needed; // the worst case, for the refusal's message
             std::size_t free_bytes = 0, total_bytes = 0;
             CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
             const std::size_t reserve = start_reserve();
+            if (growing) {
+                // The full-attention planes' worst case is a reservation: their granules back
+                // only as the sequences reach them (back()), so admission demands everything
+                // but them (the rings, checkpoints, histories, staging and drafter state,
+                // which are dense) beside the workspace reserve. A sequence whose next tile
+                // would not fit fails its request, not the server.
+                for (const auto& [layer, pass] : schedule) {
+                    if (config.full_attention[layer]) {
+                        needed -= std::size_t(global_slots) * full_slot_bytes;
+                    }
+                }
+                if (options.dspark) {
+                    const DSparkConfig& dc = *model.dspark_config();
+                    const std::size_t spark_kv =
+                        2 * std::size_t(dc.num_key_value_heads) * dc.head_dim * sizeof(__half) *
+                        std::size_t(sequences);
+                    for (const bool full : dc.full_attention) {
+                        if (full) { needed -= std::size_t(global_slots) * spark_kv; }
+                    }
+                }
+            }
             if (needed + reserve > free_bytes) {
                 throw InsufficientMemory(
                     "Inkling 2: the KV caches, histories, checkpoints and drafter state of " +
                     std::to_string(sequences) + " sequence(s) of " +
                     std::to_string(options.max_context) + " tokens need " +
-                    std::to_string(needed >> 20) + " MiB beside " + std::to_string(reserve >> 20) +
+                    std::to_string(needed >> 20) + " MiB" +
+                    (growing ? " backed as the sequences reach them (worst case " +
+                                   std::to_string(plan >> 20) + " MiB)" : "") +
+                    " beside " + std::to_string(reserve >> 20) +
                     " MiB for the workspace and CUDA graphs, and " +
                     std::to_string(free_bytes >> 20) +
                     " MiB are free after the weights; lower --max-concurrency or --max-context");
@@ -513,7 +540,10 @@ struct Executor::Impl {
         {
             std::size_t free_bytes = 0, total_bytes = 0;
             CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
-            if (workspace_bytes + kGraphReserve + unbacked() > free_bytes) {
+            // The workspace and the CUDA graphs must fit beside the caches' physical bytes: the
+            // elastic planes' reservation carries no pages until a sequence reaches it (back()
+            // enforces that against free VRAM then, trading granules against the expert cache).
+            if (workspace_bytes + kGraphReserve > free_bytes) {
                 throw InsufficientMemory(
                     "Inkling 2: the workspace of " + std::to_string(workspace_bytes >> 20) +
                     " MiB and " + std::to_string(kGraphReserve >> 20) +
@@ -1355,9 +1385,11 @@ struct Executor::Impl {
         }
         std::size_t free = 0, total = 0;
         CUDA_CHECK(cudaMemGetInfo(&free, &total));
-        if (free < need + kGraphReserve) { delivery->shrink_cache(need + kGraphReserve - free); }
+        if (delivery && free < need + kGraphReserve) {
+            delivery->shrink_cache(need + kGraphReserve - free);
+        }
         while (!apply()) {
-            if (delivery->shrink_cache(std::max(need, std::size_t(64) << 20)) == 0) {
+            if (!delivery || delivery->shrink_cache(std::max(need, std::size_t(64) << 20)) == 0) {
                 count_backed();
                 throw InsufficientMemory("Inkling 2: no device memory left to grow the KV cache "
                                          "to " + std::to_string(slots) + " positions");
@@ -1371,7 +1403,7 @@ struct Executor::Impl {
         CUDA_CHECK(ninfer::wait_for_stream(stream));
         for (KvArea* area : sequence_areas) { trim(*area, sequence, 0); }
         count_backed();
-        delivery->grow_cache();
+        if (delivery) { delivery->grow_cache(); }
     }
 
     std::size_t start_reserve() const {
