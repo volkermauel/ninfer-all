@@ -98,8 +98,9 @@ tokenization, the chat template, output parsing and the serving protocols.
 Not built for this family: MTP, DFlash, n-gram copy drafts and their archive, `--draft-confidence`,
 rotation scaling (the attention has no rotation), thinking budgets, video, pipeline stages, and of
 the context cache the shared paged KV pool, the disk tier and session slots. The quantized
-`--kv-dtype rk8v4` and `rk4v4` quantize the eight full-attention visits' planes (the windowed
-visits' rings, the convolution histories and a DSpark drafter's caches stay F16); the other
+`--kv-dtype rk8v4` and `rk4v4` quantize every visit's planes — the eight full-attention visits'
+elastic planes and the windowed visits' fixed sliding rings (only the convolution histories and a
+DSpark drafter's caches stay F16); the other
 quantized formats (`int8`, `fp8`, `nvfp4`, `k8v4`, `rk4v4-e8`, `rk2v4-e8`, `bf16p`) are not built.
 DSpark drafts for one request at a
 time; with several requests decoding, each decodes a token a step.

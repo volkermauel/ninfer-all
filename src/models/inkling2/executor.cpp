@@ -158,10 +158,10 @@ struct VisitPlan {
     bool restart      = false; // the core's first visit of a later pass
     bool control      = false; // a later pass's core visit
     bool start        = false; // the layer starts a residual block
-    // The F16 K and V caches: [sequences][kv heads][slots][D]. A quantized full visit has none;
-    // its rows live in its code and scale planes.
+    // The F16 K and V caches: [sequences][kv heads][slots][D]. A quantized visit has none; its
+    // rows live in its code and scale planes.
     KvArea k, v;
-    // The quantized planes' codes and scales (a full visit of a quantized run): the same
+    // The quantized planes' codes and scales (a visit of a quantized run): the same
     // [sequences][kv heads][slots] addressing, one row of codes and one of scales per slot.
     KvArea k_codes, k_scales, v_codes, v_scales;
     int slots = 0, ring = 0;
@@ -364,12 +364,12 @@ struct Executor::Impl {
         const auto schedule  = config.visits();
         const int sequences  = int(options.sequences);
         const std::size_t row_f16 = std::size_t(kD) * sizeof(__half);
-        // Bytes of one full visit's K and V rows of one slot: F16 halves, or a quantized row's
-        // codes and scales.
+        // Bytes of one visit's K and V rows of one slot (full or sliding): F16 halves, or a
+        // quantized row's codes and scales.
         const auto plane_bytes = [](KvCoding c) {
             return std::size_t(kv_code_bytes(c)) + std::size_t(kv_scale_bytes(c));
         };
-        const std::size_t full_slot_bytes =
+        const std::size_t slot_bytes =
             kvfmt.quantized()
                 ? std::size_t(kv_heads) * (plane_bytes(kvfmt.key.coding) +
                                            plane_bytes(kvfmt.value.coding)) * std::size_t(sequences)
@@ -378,9 +378,8 @@ struct Executor::Impl {
             std::size_t needed = 0;
             for (const auto& [layer, pass] : schedule) {
                 needed += config.full_attention[layer]
-                              ? std::size_t(global_slots) * full_slot_bytes
-                              : (options.checkpoints ? 2 : 1) * std::size_t(ring) *
-                                    2 * std::size_t(kv_heads) * row_f16 * std::size_t(sequences);
+                              ? std::size_t(global_slots) * slot_bytes
+                              : (options.checkpoints ? 2 : 1) * std::size_t(ring) * slot_bytes;
             }
             needed += (options.checkpoints ? 2 : 1) * std::size_t(sequences) * schedule.size() *
                       kR * std::size_t(slot_floats) * 4;
@@ -402,7 +401,7 @@ struct Executor::Impl {
                 // would not fit fails its request, not the server.
                 for (const auto& [layer, pass] : schedule) {
                     if (config.full_attention[layer]) {
-                        needed -= std::size_t(global_slots) * full_slot_bytes;
+                        needed -= std::size_t(global_slots) * slot_bytes;
                     }
                 }
                 if (options.dspark) {
@@ -447,9 +446,10 @@ struct Executor::Impl {
             p.head_stride  = std::int64_t(p.slots) * kD;
             p.seq_stride   = p.head_stride * kv_heads;
             const bool grows = growing && p.full;
-            if (p.full && kvfmt.quantized()) {
+            if (kvfmt.quantized()) {
                 // One code and one scale area per plane; a row is one head's whole block of
                 // slots (the F16 caches' row shape), position_bytes one slot's codes or scales.
+                // A full visit's planes grow with the sequence, a sliding visit's ring is fixed.
                 const auto area = [&](KvCoding coding) {
                     const std::size_t code  = std::size_t(kv_code_bytes(coding));
                     const std::size_t scale = std::size_t(kv_scale_bytes(coding));
@@ -476,9 +476,20 @@ struct Executor::Impl {
                 }
             }
             if (!p.full && options.checkpoints) {
-                for (int c = 0; c < 2; ++c) {
-                    p.checkpoint.emplace_back(std::size_t(p.seq_stride) * sizeof(__half) * sequences);
-                    kv_bytes += p.checkpoint.back().bytes;
+                // The rings' checkpoint: a quantized visit's planes' bytes, the F16 pair's halves.
+                if (kvfmt.quantized()) {
+                    for (const KvArea* area :
+                         {&p.k_codes, &p.k_scales, &p.v_codes, &p.v_scales}) {
+                        p.checkpoint.emplace_back(std::size_t(area->row_bytes) * kv_heads *
+                                                  sequences);
+                        kv_bytes += p.checkpoint.back().bytes;
+                    }
+                } else {
+                    for (int c = 0; c < 2; ++c) {
+                        p.checkpoint.emplace_back(std::size_t(p.seq_stride) * sizeof(__half) *
+                                                  sequences);
+                        kv_bytes += p.checkpoint.back().bytes;
+                    }
                 }
             }
             visits.push_back(std::move(p));
@@ -2233,12 +2244,34 @@ struct Executor::Impl {
         }
         // K and V into the cache: a prompt chunk's sliding visit attends over the staging ring
         // (the window before the chunk comes over from the sequence's ring, the chunk's keys land
-        // there, and the window that ends the chunk's kept rows goes back). A quantized full
-        // visit stages its rows as F16 (one slot per row) for kv_store to encode into its planes.
+        // there, and the window that ends the chunk's kept rows goes back). A quantized visit
+        // stages its rows as F16 (one slot per row) for kv_store to encode into its planes; a
+        // quantized sliding visit's chunk decodes the window from its ring planes into the
+        // staging (ring_load) and encodes the kept rows back into them.
         const std::int64_t stage_stride = std::int64_t(prefill_ring) * kD;
         const std::int64_t seq_offset   = std::int64_t(c.sequence) * vp.seq_stride;
         const bool staging   = c.chunk && !vp.full;
-        const bool quantized = vp.full && kvfmt.quantized();
+        const bool quantized = kvfmt.quantized();
+        // The visit's planes (quantized only): what kv_store encodes into, ring_load decodes from
+        // and the attention reads (a sliding visit's chunk reads the F16 staging instead).
+        KvPlaneView k_view, v_view;
+        const auto view = [&](const KvArea& codes, const KvArea& scales, KvCoding coding) {
+            KvPlaneView plane;
+            plane.codes   = static_cast<std::uint8_t*>(codes.p);
+            plane.scales  = static_cast<std::uint8_t*>(scales.p);
+            plane.code_row  = kv_code_bytes(coding);
+            plane.scale_row = kv_scale_bytes(coding);
+            plane.code_head  = std::int64_t(vp.slots) * plane.code_row;
+            plane.scale_head = std::int64_t(vp.slots) * plane.scale_row;
+            plane.code_seq  = plane.code_head * kv_heads;
+            plane.scale_seq = plane.scale_head * kv_heads;
+            plane.coding    = coding;
+            return plane;
+        };
+        if (quantized) {
+            k_view = view(vp.k_codes, vp.k_scales, kvfmt.key.coding);
+            v_view = view(vp.v_codes, vp.v_scales, kvfmt.value.coding);
+        }
         kernels::RingCopyArgs keep;
         keep.kv_heads = kv_heads;
         kernels::KvArgs ka;
@@ -2256,26 +2289,44 @@ struct Executor::Impl {
         ka.kv_heads    = kv_heads;
         ka.qk_clip     = config.qk_clip;
         ka.eps         = eps;
-        if (quantized) {
+        if (quantized && !staging) {
             auto* stage = static_cast<__half*>(workspace->alloc_bytes(std::size_t(t) * 2 * kvd * 2).data);
             ka.k_cache     = stage;
             ka.v_cache     = stage + std::size_t(t) * kvd;
             ka.seq_stride  = 0;
             ka.head_stride = std::int64_t(t) * kD;
-            ka.ring        = 0;
+            // The attention reads the planes at the visit's ring (kv_post ignores it: row_slots).
+            ka.ring        = vp.ring;
             ka.row_slots   = true;
         } else if (staging) {
-            keep.src_k           = static_cast<const __half*>(vp.k.p) + seq_offset;
-            keep.src_v           = static_cast<const __half*>(vp.v.p) + seq_offset;
             keep.dst_k           = static_cast<__half*>(staging_k.p);
             keep.dst_v           = static_cast<__half*>(staging_v.p);
-            keep.src_head_stride = vp.head_stride;
             keep.dst_head_stride = stage_stride;
-            keep.src_ring        = vp.ring;
             keep.dst_ring        = prefill_ring;
             keep.begin           = std::max(0, c.first - window);
             keep.end             = c.first;
-            kernels::ring_copy(keep, stream);
+            if (quantized) {
+                // The window before the chunk comes over from the ring planes, decoded.
+                kernels::RingLoadArgs load;
+                load.src_k = k_view;
+                load.src_v = v_view;
+                load.dst_k = keep.dst_k;
+                load.dst_v = keep.dst_v;
+                load.dst_head_stride = keep.dst_head_stride;
+                load.src_ring  = vp.ring;
+                load.dst_ring  = prefill_ring;
+                load.kv_heads  = kv_heads;
+                load.begin     = keep.begin;
+                load.end       = keep.end;
+                load.sequence  = int(c.sequence);
+                kernels::ring_load(load, stream);
+            } else {
+                keep.src_k           = static_cast<const __half*>(vp.k.p) + seq_offset;
+                keep.src_v           = static_cast<const __half*>(vp.v.p) + seq_offset;
+                keep.src_head_stride = vp.head_stride;
+                keep.src_ring        = vp.ring;
+                kernels::ring_copy(keep, stream);
+            }
             ka.k_cache     = static_cast<__half*>(staging_k.p);
             ka.v_cache     = static_cast<__half*>(staging_v.p);
             ka.seq_stride  = 0;
@@ -2289,29 +2340,14 @@ struct Executor::Impl {
             ka.ring        = vp.ring;
         }
         kernels::kv_post(ka, stream);
-        KvPlaneView k_view, v_view; // a quantized full visit's planes, else null codings
-        if (quantized) {
-            const auto view = [&](const KvArea& codes, const KvArea& scales, KvCoding coding) {
-                KvPlaneView plane;
-                plane.codes   = static_cast<std::uint8_t*>(codes.p);
-                plane.scales  = static_cast<std::uint8_t*>(scales.p);
-                plane.code_row  = kv_code_bytes(coding);
-                plane.scale_row = kv_scale_bytes(coding);
-                plane.code_head  = std::int64_t(vp.slots) * plane.code_row;
-                plane.scale_head = std::int64_t(vp.slots) * plane.scale_row;
-                plane.code_seq  = plane.code_head * kv_heads;
-                plane.scale_seq = plane.scale_head * kv_heads;
-                plane.coding    = coding;
-                return plane;
-            };
-            k_view = view(vp.k_codes, vp.k_scales, kvfmt.key.coding);
-            v_view = view(vp.v_codes, vp.v_scales, kvfmt.value.coding);
+        if (quantized && !staging) {
             for (const auto& [src, plane] :
                  {std::pair{ka.k_cache, k_view}, std::pair{ka.v_cache, v_view}}) {
                 kernels::KvStoreArgs store;
                 store.rows            = c.rows;
                 store.src             = src;
                 store.src_head_stride = std::int64_t(t) * kD;
+                store.dst_ring        = vp.ring;
                 store.rows_count      = t;
                 store.heads           = kv_heads;
                 store.dst             = plane;
@@ -2342,8 +2378,10 @@ struct Executor::Impl {
             aa.extent      = int(lp.full ? config.relative_extent : config.sliding_window);
             aa.k_cache     = ka.k_cache;
             aa.v_cache     = ka.v_cache;
-            aa.k_plane     = k_view;
-            aa.v_plane     = v_view;
+            // A quantized visit's planes take the caches' place — except a sliding visit's
+            // chunk, whose staging holds the window and the chunk's own rows as halves.
+            aa.k_plane     = quantized && !staging ? k_view : KvPlaneView{};
+            aa.v_plane     = quantized && !staging ? v_view : KvPlaneView{};
             aa.seq_stride  = ka.seq_stride;
             aa.head_stride = ka.head_stride;
             aa.ring        = ka.ring;
@@ -2363,16 +2401,40 @@ struct Executor::Impl {
             kernels::attention(aa, stream);
         }
         if (staging && c.kept > 0) {
-            kernels::RingCopyArgs back = keep;
-            std::swap(back.src_head_stride, back.dst_head_stride);
-            std::swap(back.src_ring, back.dst_ring);
-            back.src_k = static_cast<const __half*>(staging_k.p);
-            back.src_v = static_cast<const __half*>(staging_v.p);
-            back.dst_k = static_cast<__half*>(vp.k.p) + seq_offset;
-            back.dst_v = static_cast<__half*>(vp.v.p) + seq_offset;
-            back.begin = std::max(0, c.first + c.kept - window);
-            back.end   = c.first + c.kept;
-            kernels::ring_copy(back, stream);
+            const int back_begin = std::max(0, c.first + c.kept - window);
+            const int back_end   = c.first + c.kept;
+            if (quantized) {
+                // The window that ends the chunk's kept rows goes back, encoded into the ring
+                // planes (the staging's rows at their slots, the rows' positions into theirs).
+                for (const auto& [src, plane] :
+                     {std::pair{static_cast<const __half*>(staging_k.p), k_view},
+                      std::pair{static_cast<const __half*>(staging_v.p), v_view}}) {
+                    kernels::KvStoreArgs store;
+                    store.rows            = c.rows;
+                    store.src             = src;
+                    store.src_head_stride = stage_stride;
+                    store.src_row_slots   = false;
+                    store.src_ring        = prefill_ring;
+                    store.dst_ring        = vp.ring;
+                    store.begin           = back_begin;
+                    store.end             = back_end;
+                    store.rows_count      = t;
+                    store.heads           = kv_heads;
+                    store.dst             = plane;
+                    kernels::kv_store(store, stream);
+                }
+            } else {
+                kernels::RingCopyArgs back = keep;
+                std::swap(back.src_head_stride, back.dst_head_stride);
+                std::swap(back.src_ring, back.dst_ring);
+                back.src_k = static_cast<const __half*>(staging_k.p);
+                back.src_v = static_cast<const __half*>(staging_v.p);
+                back.dst_k = static_cast<__half*>(vp.k.p) + seq_offset;
+                back.dst_v = static_cast<__half*>(vp.v.p) + seq_offset;
+                back.begin = back_begin;
+                back.end   = back_end;
+                kernels::ring_copy(back, stream);
+            }
         }
         auto* y = static_cast<float*>(workspace->alloc_bytes(std::size_t(c.plane) * 4).data);
         product(lp.output, c.q8 ? attn_q.base : nullptr, attn, t, y, hidden);
@@ -2969,12 +3031,23 @@ struct Executor::Impl {
 
     // ---- Checkpoints and images ------------------------------------------------------------------
 
-    // A sliding visit's ring buffers of one sequence, (start, bytes): K and V.
-    std::array<std::pair<std::uint8_t*, std::size_t>, 2> ring_buffers(const VisitPlan& p,
-                                                                      std::uint32_t sequence) const {
-        const std::size_t bytes = std::size_t(p.seq_stride) * sizeof(__half);
-        return {{{static_cast<std::uint8_t*>(p.k.p) + sequence * bytes, bytes},
-                 {static_cast<std::uint8_t*>(p.v.p) + sequence * bytes, bytes}}};
+    // A sliding visit's per-sequence ring spans, (start, bytes): the F16 pair's K and V, or a
+    // quantized visit's planes' codes and scales (K's then V's).
+    std::vector<std::pair<std::uint8_t*, std::size_t>> ring_spans(const VisitPlan& p,
+                                                                  std::uint32_t sequence) const {
+        std::vector<std::pair<std::uint8_t*, std::size_t>> spans;
+        if (p.k_codes.p != nullptr) {
+            for (const KvArea* area : {&p.k_codes, &p.k_scales, &p.v_codes, &p.v_scales}) {
+                spans.emplace_back(static_cast<std::uint8_t*>(area->p) +
+                                       sequence * area->row_bytes * kv_heads,
+                                   area->row_bytes * kv_heads);
+            }
+        } else {
+            const std::size_t bytes = std::size_t(p.seq_stride) * sizeof(__half);
+            spans.emplace_back(static_cast<std::uint8_t*>(p.k.p) + sequence * bytes, bytes);
+            spans.emplace_back(static_cast<std::uint8_t*>(p.v.p) + sequence * bytes, bytes);
+        }
+        return spans;
     }
 
     [[nodiscard]] std::size_t sequence_history_bytes() const {
@@ -3004,11 +3077,12 @@ struct Executor::Impl {
         }
         for (const VisitPlan* p : cache_plans()) {
             if (p->full) { continue; }
-            const auto rings = ring_buffers(*p, sequence);
-            for (std::size_t i = 0; i < rings.size(); ++i) {
-                auto* kept = static_cast<std::uint8_t*>(p->checkpoint[i].p) + sequence * rings[i].second;
-                CUDA_CHECK(cudaMemcpyAsync(save ? kept : rings[i].first, save ? rings[i].first : kept,
-                                           rings[i].second, cudaMemcpyDeviceToDevice, stream));
+            const auto spans = ring_spans(*p, sequence);
+            for (std::size_t i = 0; i < spans.size(); ++i) {
+                auto* kept = static_cast<std::uint8_t*>(p->checkpoint[i].p) + sequence * spans[i].second;
+                CUDA_CHECK(cudaMemcpyAsync(save ? kept : spans[i].first,
+                                           save ? spans[i].first : kept, spans[i].second,
+                                           cudaMemcpyDeviceToDevice, stream));
             }
         }
         if (spark) {
@@ -3031,7 +3105,7 @@ struct Executor::Impl {
             if (p->full) {
                 bytes += 2 * std::uint64_t(kv_heads) * position * kD * sizeof(__half);
             } else {
-                for (const auto& r : ring_buffers(*p, 0)) { bytes += r.second; }
+                for (const auto& s : ring_spans(*p, 0)) { bytes += s.second; }
             }
         }
         if (spark) { bytes += spark_context_bytes(); }
@@ -3081,12 +3155,12 @@ struct Executor::Impl {
                 }
                 continue;
             }
-            const auto rings = ring_buffers(*p, sequence);
-            for (std::size_t i = 0; i < rings.size(); ++i) {
+            const auto spans = ring_spans(*p, sequence);
+            for (std::size_t i = 0; i < spans.size(); ++i) {
                 std::uint8_t* device =
-                    checkpoint ? static_cast<std::uint8_t*>(p->checkpoint[i].p) + sequence * rings[i].second
-                               : rings[i].first;
-                copy(device, rings[i].second);
+                    checkpoint ? static_cast<std::uint8_t*>(p->checkpoint[i].p) + sequence * spans[i].second
+                               : spans[i].first;
+                copy(device, spans[i].second);
             }
         }
         if (spark) {
