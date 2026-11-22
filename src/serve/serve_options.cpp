@@ -357,7 +357,14 @@ std::string serve_usage_text(const char* argv0) {
            "); alias --vram-headroom-mib\n"
            "  --kv-dtype T                  KV storage: bf16 (default), int8, fp8, rk8v4,\n"
            "                                rk4v4, rk4v4-e8, rk2v4-e8, nvfp4, k8v4 or bf16p;\n"
-           "                                fp16: Flash-Next, Gemma 4 and Flint\n" +
+           "                                fp16: Flash-Next, Gemma 4 and Flint\n"
+           "  --kv-paging                   Inkling 2: the eight full-attention visits'\n"
+           "                                quantized planes (rk8v4 / rk4v4) live in a shared\n"
+           "                                pool of 64-token page groups that lanes lease as\n"
+           "                                they grow; uneven lane usage packs, and requests\n"
+           "                                that do not fit wait in the queue\n"
+           "  --kv-page-budget N            the pool's device-byte ceiling in MiB (0: sized\n"
+           "                                from free memory; default 0)\n" +
            std::string(product::kKvResidentHelp) +
            "\n"
            "CONTEXT CACHE\n"
@@ -1327,6 +1334,14 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
         }
         if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
+            continue;
+        }
+        if (product::switch_option(arg, "kv-paging", [&](bool on) { options.kv_paging = on; })) {
+            continue;
+        }
+        if (arg == "--kv-page-budget") {
+            options.kv_page_budget_mib = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--kv-page-budget"), "kv-page-budget"));
             continue;
         }
         if (arg == "--spec") {

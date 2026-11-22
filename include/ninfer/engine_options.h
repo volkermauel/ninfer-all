@@ -634,6 +634,13 @@ struct EngineOptions {
     // binary16 store. Gemma 4 and Flint keep their F16 caches under either name; the Qwen3.5
     // Program and DeepSeek-V4.1 refuse it. BF16 stays the default.
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
+    // Inkling 2: the eight full-attention visits' quantized planes live in a shared pool of
+    // 64-token page groups (--kv-paging) that lanes lease as they grow; needs --kv-dtype
+    // rk8v4 or rk4v4. Off keeps the dense per-sequence planes.
+    bool kv_paging                     = false;
+    // The pool's device-byte ceiling in MiB (0: as much as the device frees beside the fixed
+    // caches, the workspace and the CUDA graphs).
+    std::uint32_t kv_page_budget_mib   = 0;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;

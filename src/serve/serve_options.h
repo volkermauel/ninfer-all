@@ -96,6 +96,10 @@ struct ServeOptions {
     NgramTableOptions ngram_table;
     std::optional<std::uint32_t> kv_resident_positions; // Flash-Next: --kv-resident
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
+    // Inkling 2: --kv-paging pools the eight full-attention visits' quantized planes;
+    // --kv-page-budget caps the pool in MiB (0: sized from free memory).
+    bool kv_paging                         = false;
+    std::uint32_t kv_page_budget_mib       = 0;
     SpeculativeOptions speculative;
     bool ngram_native_sessions = false;
     ContextCacheOptions context_cache;

@@ -806,6 +806,8 @@ std::string format_server_start_json(
         {"fast_prefill_kernel", engine_options.fast_prefill_kernel},
         {"log_stats_interval_ms", options.log_stats_interval_ms},
         {"kv_cache", kv_cache_name(engine_options.kv_cache)},
+        {"kv_paging", engine_options.kv_paging},
+        {"kv_page_budget_mib", engine_options.kv_page_budget_mib},
         {"vision", engine_options.enable_vision},
         {"cuda_graph", engine_options.use_cuda_graph},
         {"lm_head_q4", engine_options.lm_head_q4},

@@ -429,6 +429,7 @@ void HttpServer::run_stats_reporter() {
             if (!tail && console_stats_ && (public_model_id_.empty() || id == public_model_id_)) {
                 console_stats_->runtime(current);
             }
+            if (!tail) { operational_log_.engine_pages(service.memory_summary()); }
             found->second = Previous{&service, current, now};
         });
     };

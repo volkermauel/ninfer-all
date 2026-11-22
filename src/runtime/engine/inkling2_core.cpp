@@ -235,6 +235,10 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
     executor.sequences     = std::clamp<std::uint32_t>(options.max_concurrency, 1, 8);
     executor.cuda_graphs   = options.use_cuda_graph;
     executor.kv_cache      = options.kv_cache;
+    executor.paged_kv      = options.kv_paging;
+    if (options.kv_paging && options.kv_page_budget_mib != 0) {
+        executor.paged_kv_budget_bytes = std::uint64_t(options.kv_page_budget_mib) << 20;
+    }
     executor.draft_tokens  = dspine ? speculative.draft_tokens : lookup_drafts;
     executor.dspine        = dspine;
     executor.dspark        = dspark;
@@ -317,7 +321,10 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
                        executor.sequences, executor.prefill_chunk, kv_name,
                        double(instance->executor->memory().kv_bytes) / 1048576.0,
                        instance->executor->memory().kv_grows
-                           ? " at most, growing with the sequences beside an elastic expert cache"
+                           ? (executor.paged_kv
+                                  ? " at most, growing with the sequences in the page pool"
+                                  : " at most, growing with the sequences beside an elastic "
+                                    "expert cache")
                            : "",
                        double(instance->executor->memory().workspace_bytes) / 1048576.0);
     if (model->expert_parallel()) {
@@ -1212,6 +1219,25 @@ struct Inkling2Core::Impl {
                     }
                 }
                 if (!best) { return; }
+                // --kv-paging: the request's pages must fit beside the other lanes' grants. The
+                // idle lane's own pages, held since its last request, go to the store and back
+                // to the pool first when the prompt does not continue them; what still does not
+                // fit waits in the queue instead of failing mid-flight.
+                if (instance.executor->paged_kv()) {
+                    Slot& chosen = slots[*best];
+                    const auto& head = *pending.front();
+                    const auto prompt_n = std::uint32_t(head.prompt_tokens.size());
+                    const std::uint32_t output = effective_output_capacity(
+                        head.options.execution.requested_output_tokens, max_context, prompt_n);
+                    const std::uint32_t tokens = prompt_n + output;
+                    bool fits = instance.executor->reserve_pages(*best, tokens);
+                    if (!fits && reuse(chosen, head) == 0) {
+                        if (reuse_prefixes) { retire(*best); }
+                        instance.executor->reset(*best);
+                        fits = instance.executor->reserve_pages(*best, tokens);
+                    }
+                    if (!fits) { return; }
+                }
                 request = std::move(pending.front());
                 pending.pop_front();
             }
@@ -2952,6 +2978,9 @@ MemorySummary Inkling2Core::memory_summary() const {
     out.max_context = impl_->max_context;
     out.kv_capacity = impl_->max_context;
     out.kv_cache    = impl_->kv_cache; // F16 rows either way
+    // --kv-paging: the pool's page groups, in use and at capacity.
+    out.kv_capacity_page_groups     = memory.kv_pages;
+    out.kv_capacity_max_page_groups = memory.kv_pages_max;
     out.host_kv_capacity_bytes = impl_->host_budget;
     {
         std::lock_guard lock(impl_->stats_mutex);

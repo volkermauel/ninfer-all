@@ -568,6 +568,15 @@ void OperationalLog::http_failure(std::string_view endpoint, const RequestFailur
     write({.severity = failure_severity(failure.classification), .message = out.str()});
 }
 
+// The page pool's live usage, at the stats interval (--kv-paging families only; silent without
+// one, where the capacity line's pages 0/0 stays).
+void OperationalLog::engine_pages(const ninfer::MemorySummary& memory) const {
+    if (memory.kv_capacity_max_page_groups == 0) { return; }
+    logger_->info("pages | {}/{} page groups in use",
+                  product::format_pretty_count(memory.kv_capacity_page_groups),
+                  product::format_pretty_count(memory.kv_capacity_max_page_groups));
+}
+
 void OperationalLog::engine_capacity(const GenerationService& service) const {
     const ninfer::MemorySummary memory            = service.memory_summary();
     const ninfer::EngineOptions& engine           = service.engine_options();
