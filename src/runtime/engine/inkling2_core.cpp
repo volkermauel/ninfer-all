@@ -1219,27 +1219,35 @@ struct Inkling2Core::Impl {
                     }
                 }
                 if (!best) { return; }
-                // --kv-paging: the request's pages must fit beside the other lanes' grants. The
-                // idle lane's own pages, held since its last request, go to the store and back
-                // to the pool first when the prompt does not continue them; what still does not
-                // fit waits in the queue instead of failing mid-flight.
-                if (instance.executor->paged_kv()) {
-                    Slot& chosen = slots[*best];
-                    const auto& head = *pending.front();
-                    const auto prompt_n = std::uint32_t(head.prompt_tokens.size());
-                    const std::uint32_t output = effective_output_capacity(
-                        head.options.execution.requested_output_tokens, max_context, prompt_n);
-                    const std::uint32_t tokens = prompt_n + output;
-                    bool fits = instance.executor->reserve_pages(*best, tokens);
-                    if (!fits && reuse(chosen, head) == 0) {
-                        if (reuse_prefixes) { retire(*best); }
-                        instance.executor->reset(*best);
-                        fits = instance.executor->reserve_pages(*best, tokens);
+                // The queue deadline applies to a request the pool cannot hold, too: it is
+                // completed with the timeout rather than waiting behind the check forever.
+                if (Clock::now() > pending.front()->deadline) {
+                    request = std::move(pending.front());
+                    pending.pop_front();
+                } else {
+                    // --kv-paging: the request's pages must fit beside the other lanes' grants.
+                    // The idle lane's own pages, held since its last request, go to the store
+                    // and back to the pool first when the prompt does not continue them; what
+                    // still does not fit waits in the queue instead of failing mid-flight.
+                    if (instance.executor->paged_kv()) {
+                        Slot& chosen = slots[*best];
+                        const auto& head = *pending.front();
+                        const auto prompt_n = std::uint32_t(head.prompt_tokens.size());
+                        const std::uint32_t output = effective_output_capacity(
+                            head.options.execution.requested_output_tokens, max_context,
+                            prompt_n);
+                        const std::uint32_t tokens = prompt_n + output;
+                        bool fits = instance.executor->reserve_pages(*best, tokens);
+                        if (!fits && reuse(chosen, head) == 0) {
+                            if (reuse_prefixes) { retire(*best); }
+                            instance.executor->reset(*best);
+                            fits = instance.executor->reserve_pages(*best, tokens);
+                        }
+                        if (!fits) { return; }
                     }
-                    if (!fits) { return; }
+                    request = std::move(pending.front());
+                    pending.pop_front();
                 }
-                request = std::move(pending.front());
-                pending.pop_front();
             }
             if (Clock::now() > request->deadline) {
                 complete(request, std::make_exception_ptr(
@@ -1307,6 +1315,16 @@ struct Inkling2Core::Impl {
             slot.anchor.clear();
             slot.media.clear();
             slot.anchor_media.clear();
+            // reset() released the lane's grant with its pages: re-place this request's, so it
+            // runs covered and a pool that cannot hold it beside the other lanes refuses here,
+            // at planning, rather than mid-flight.
+            if (executor.paged_kv() &&
+                !executor.reserve_pages(s, prompt_n + effective_output_capacity(
+                                                            r.options.execution.requested_output_tokens,
+                                                            max_context, prompt_n))) {
+                throw RequestError(RequestErrorKind::ContextLengthExceeded,
+                                   "the page pool cannot hold the request beside the others");
+            }
         }
         slot.request    = request;
         slot.last_used  = ++use_clock;

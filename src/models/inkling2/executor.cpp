@@ -443,8 +443,8 @@ struct Executor::Impl {
                 if (ceiling < lane_pages) {
                     throw InsufficientMemory(
                         "Inkling 2: the page pool needs " + std::to_string(lane_pages) +
-                        " page groups of " + std::to_string((page_group >> 20) + 1) +
-                        " MiB each for one sequence of " + std::to_string(options.max_context) +
+                        " page groups of " + std::to_string(page_group >> 10) +
+                        " KiB each for one sequence of " + std::to_string(options.max_context) +
                         " tokens, and only " + std::to_string(ceiling) + " fit beside the fixed "
                         "caches; lower --max-concurrency, --max-context or --kv-page-budget");
                 }
@@ -1469,17 +1469,20 @@ struct Executor::Impl {
         auto& leases = page_leases[sequence];
         if (leases.capacity() < groups) { leases.reserve(groups); }
         auto& reservation = page_reservations[sequence];
-        if (reservation.pages() < groups) {
-            if (!pool->can_resize_reservation(reservation, groups)) {
+        // materialize consumes the grant as it leases: extend it only for the delta the new
+        // groups need past the leases already held.
+        const std::uint32_t needed = groups - std::uint32_t(leases.size());
+        if (reservation.pages() < needed) {
+            if (!pool->can_resize_reservation(reservation, needed)) {
                 count_backed();
                 throw InsufficientMemory(
                     "Inkling 2: the page pool cannot extend sequence " +
                     std::to_string(sequence) + " to " +
                     std::to_string(std::uint64_t(groups) * kPagedKVPageSize) + " positions");
             }
-            pool->resize_reservation(reservation, groups);
+            pool->resize_reservation(reservation, needed);
         }
-        pool->materialize(reservation, groups, page_leases[sequence]);
+        pool->materialize(reservation, groups, leases);
         tables->publish(execution_rows[sequence].handle(), 0, page_leases[sequence],
                         RankStreams(stream));
         count_backed();
@@ -1491,9 +1494,14 @@ struct Executor::Impl {
         if (!paged) { return true; }
         const std::uint32_t groups = std::uint32_t(
             (std::uint64_t(tokens) + kPagedKVPageSize - 1) / kPagedKVPageSize);
-        if (groups <= page_reservations[sequence].pages()) { return true; }
-        if (!pool->can_resize_reservation(page_reservations[sequence], groups)) { return false; }
-        pool->resize_reservation(page_reservations[sequence], groups);
+        auto& reservation = page_reservations[sequence];
+        // The lanes' held leases count toward their extent: a lane resuming its own retained
+        // prefix needs only the delta past them.
+        const std::uint32_t held = std::uint32_t(page_leases[sequence].size());
+        if (held + reservation.pages() >= groups) { return true; }
+        const std::uint32_t remaining = groups - held;
+        if (!pool->can_resize_reservation(reservation, remaining)) { return false; }
+        pool->resize_reservation(reservation, remaining);
         return true;
     }
 
