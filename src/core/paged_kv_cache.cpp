@@ -901,8 +901,19 @@ void DeviceKVPagePool::copy_host_run(cudaMemcpyKind kind, std::size_t plane_begi
                 return;
             }
             if (to_host) {
-                CUDA_CHECK(cudaMemcpy2DAsync(host_ptr, row_pitch, device_ptr, device_pitch, width,
-                                             rows, cudaMemcpyDeviceToHost, stream));
+                const cudaError_t status = cudaMemcpy2DAsync(
+                    host_ptr, row_pitch, device_ptr, device_pitch, width, rows,
+                    cudaMemcpyDeviceToHost, stream);
+                if (status != cudaSuccess) {
+                    std::fprintf(stderr,
+                                 "copy2d D2H failed: plane %zu rows %zu width %zu row_pitch %zu "
+                                 "device_pitch %zu host %p device %p first %d capacity %u\n",
+                                 plane_index, rows, width, row_pitch, device_pitch,
+                                 static_cast<const void*>(host_ptr),
+                                 static_cast<const void*>(device_ptr), first,
+                                 spec_.page_group_count);
+                }
+                CUDA_CHECK(status);
             } else {
                 CUDA_CHECK(cudaMemcpy2DAsync(device_ptr, device_pitch, host_ptr, row_pitch, width,
                                              rows, cudaMemcpyHostToDevice, stream));
