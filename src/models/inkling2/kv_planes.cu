@@ -37,10 +37,12 @@ __launch_bounds__(kWarps * 32) __global__ void kv_store_kernel(KvStoreArgs a) {
     float x[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) { x[i] = __half2float(src[lane + 32 * i]); }
-    std::uint8_t* codes  = a.dst.codes + sequence * a.dst.code_seq + head * a.dst.code_head +
-                          std::int64_t(slot) * a.dst.code_row;
-    std::uint8_t* scales = a.dst.scales + sequence * a.dst.scale_seq + head * a.dst.scale_head +
-                           std::int64_t(slot) * a.dst.scale_row;
+    std::uint8_t* codes  = a.dst.codes + kv_plane_offset(a.dst, sequence, head, slot,
+                                                         a.dst.code_seq, a.dst.code_head,
+                                                         a.dst.code_row, a.dst.code_page);
+    std::uint8_t* scales = a.dst.scales + kv_plane_offset(a.dst, sequence, head, slot,
+                                                          a.dst.scale_seq, a.dst.scale_head,
+                                                          a.dst.scale_row, a.dst.scale_page);
     kv::encode_row<C>(x, codes, scales, lane);
 }
 
