@@ -5,6 +5,9 @@
 #include "core/device_wait.h"
 #include "core/expert_parallel.h"
 #include "core/growable_region.h"
+#include "core/paged_kv_cache.h"
+#include "core/paged_kv_page.h"
+#include "core/host_kv_arena.h"
 #include "core/pinned_memory.h"
 #include "core/qtype.h"
 #include "core/tensor_parallel.h"
@@ -167,6 +170,7 @@ struct VisitPlan {
     int slots = 0, ring = 0;
     std::int64_t seq_stride = 0, head_stride = 0;
     std::vector<DeviceBuffer> checkpoint; // sliding: every sequence's rings, K then V
+    int pool_plane = -1;                  // paged: the visit's first plane in the pool (-1: none)
 };
 
 struct GraphEntry {
@@ -245,6 +249,22 @@ struct Executor::Impl {
     std::vector<KvArea*> sequence_areas;
     std::atomic<std::uint64_t> kv_backed{0};
     std::uint64_t kv_fixed = 0;
+    // --kv-paging: the shared pool of the eight full-attention visits' planes. One page group is
+    // 64 positions of every visit's four planes (visit order); a lane leases groups as it grows
+    // and its row of the execution table maps its groups. The windowed rings, the convolution
+    // histories, the ring checkpoints and the drafters' caches keep their dense buffers.
+    bool paged = false;
+    std::unique_ptr<DeviceBuffer> pool_buffer; // the pool's planes and the execution tables
+    std::unique_ptr<DeviceKVPagePool> pool;
+    std::unique_ptr<KVExecutionTablePool> tables;
+    std::vector<KVExecutionRowLease> execution_rows;
+    std::vector<std::vector<DeviceKVPageLease>> page_leases; // per sequence, ascending positions
+    std::vector<DeviceKVPageReservation> page_reservations;  // per sequence, the admission grant
+    HostKVPageLayout host_page_layout{};
+    std::uint32_t lane_pages = 0;       // page groups a lane may reach (its full window)
+    std::uint32_t pool_pages = 0;       // the pool's capacity
+    std::uint64_t page_group_bytes = 0; // bytes of one group, all planes of all visits
+    std::atomic<std::uint32_t> pages_in_use{0};
     std::vector<LayerPlan> layers;
     std::vector<VisitPlan> visits;
     // The convolutions' histories: [sequences][visits][kHistory][slot_floats], each slot K's,
@@ -312,8 +332,13 @@ struct Executor::Impl {
         }
         stream = device.stream;
         const int device_id = device.rank(0).device;
-        kvfmt = kv_format(o.kv_cache);
-        growing = !model.expert_banks().empty() && !options.expert_cache_bytes &&
+        kvfmt = kv_format(options.kv_cache);
+        paged   = options.paged_kv;
+        if (paged && !kvfmt.quantized()) {
+            throw std::invalid_argument("inkling2: --kv-paging pools the quantized planes of the "
+                                        "eight full-attention visits (--kv-dtype rk8v4 or rk4v4)");
+        }
+        growing = !paged && !model.expert_banks().empty() && !options.expert_cache_bytes &&
                   vmm::granularity(device_id) != 0;
         hidden      = int(config.hidden_size);
         query_heads = int(config.num_attention_heads);
@@ -372,11 +397,18 @@ struct Executor::Impl {
                 ? std::size_t(kv_heads) * (plane_bytes(kvfmt.key.coding) +
                                            plane_bytes(kvfmt.value.coding)) * std::size_t(sequences)
                 : 2 * std::size_t(kv_heads) * row_f16 * std::size_t(sequences);
+        if (paged) { workspace_bytes = plan_workspace(); } // the pool's budget counts it
+        lane_pages = std::uint32_t((std::uint64_t(global_slots) + kPagedKVPageSize - 1) /
+                                   kPagedKVPageSize);
+        const std::uint64_t page_group =
+            paged ? std::uint64_t(kPagedKVPageSize) * kv_heads *
+                        (plane_bytes(kvfmt.key.coding) + plane_bytes(kvfmt.value.coding))
+                  : 0;
         {
             std::size_t needed = 0;
             for (const auto& [layer, pass] : schedule) {
                 needed += config.full_attention[layer]
-                              ? std::size_t(global_slots) * full_slot_bytes
+                              ? (paged ? 0 : std::size_t(global_slots) * full_slot_bytes)
                               : (options.checkpoints ? 2 : 1) * std::size_t(ring) *
                                     2 * std::size_t(kv_heads) * row_f16 * std::size_t(sequences);
             }
@@ -391,6 +423,34 @@ struct Executor::Impl {
             std::size_t free_bytes = 0, total_bytes = 0;
             CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
             const std::size_t reserve = start_reserve();
+            if (paged) {
+                // The pool holds at least one lane's whole window (one request of --max-context
+                // must run), and at most every lane's; an explicit budget caps it, else the
+                // device's free memory beside the fixed caches, the workspace and the graphs
+                // does. Admission reserves per request, so a smaller pool serves uneven lane
+                // usage honestly and refuses in the queue, not with an out-of-memory failure.
+                const std::uint64_t tables_bytes =
+                    round_up(std::uint64_t(lane_pages) * sequences * 4, 256);
+                std::uint64_t ceiling = std::uint64_t(lane_pages) * sequences;
+                if (options.paged_kv_budget_bytes != 0) {
+                    ceiling = std::min(ceiling, options.paged_kv_budget_bytes / page_group);
+                } else {
+                    const std::uint64_t committed =
+                        needed + reserve + tables_bytes + kGraphReserve + workspace_bytes;
+                    const std::uint64_t room = free_bytes > committed ? free_bytes - committed : 0;
+                    ceiling                  = std::min(ceiling, room / page_group);
+                }
+                if (ceiling < lane_pages) {
+                    throw InsufficientMemory(
+                        "Inkling 2: the page pool needs " + std::to_string(lane_pages) +
+                        " page groups of " + std::to_string((page_group >> 20) + 1) +
+                        " MiB each for one sequence of " + std::to_string(options.max_context) +
+                        " tokens, and only " + std::to_string(ceiling) + " fit beside the fixed "
+                        "caches; lower --max-concurrency, --max-context or --kv-page-budget");
+                }
+                pool_pages = std::uint32_t(ceiling);
+                needed += std::size_t(pool_pages) * page_group + tables_bytes;
+            }
             if (needed + reserve > free_bytes) {
                 throw InsufficientMemory(
                     "Inkling 2: the KV caches, histories, checkpoints and drafter state of " +
@@ -405,6 +465,7 @@ struct Executor::Impl {
         for (std::uint32_t i = 0; i < config.num_hidden_layers; ++i) {
             layers.push_back(plan_layer(i));
         }
+        int full_visits = 0;
         for (std::size_t v = 0; v < schedule.size(); ++v) {
             const auto [layer, pass] = schedule[v];
             VisitPlan p;
@@ -420,7 +481,9 @@ struct Executor::Impl {
             p.head_stride  = std::int64_t(p.slots) * kD;
             p.seq_stride   = p.head_stride * kv_heads;
             const bool grows = growing && p.full;
-            if (p.full && kvfmt.quantized()) {
+            if (p.full && paged) {
+                p.pool_plane = 4 * full_visits++; // the pool holds the visit's four planes
+            } else if (p.full && kvfmt.quantized()) {
                 // One code and one scale area per plane; a row is one head's whole block of
                 // slots (the F16 caches' row shape), position_bytes one slot's codes or scales.
                 const auto area = [&](KvCoding coding) {
@@ -485,7 +548,7 @@ struct Executor::Impl {
         logits_bf16 = DeviceBuffer(std::size_t(vocab) * kMaxLogitRows * 2);
         if (options.dspark) { plan_spark(device_id, sequences); }
         for (VisitPlan& p : visits) {
-            if (!p.full) { continue; }
+            if (!p.full || paged) { continue; } // paged: the pool holds the full visits
             if (p.k_codes.p != nullptr) {
                 for (KvArea* area : {&p.k_codes, &p.k_scales, &p.v_codes, &p.v_scales}) {
                     sequence_areas.push_back(area);
@@ -506,7 +569,8 @@ struct Executor::Impl {
         if (growing) {
             for (KvArea* area : sequence_areas) { kv_fixed -= area->bytes; }
         }
-        kv_backed       = kv_fixed;
+        kv_backed = kv_fixed;
+        if (paged) { build_pool(); }
         if (options.vision_max_patches > 0) { plan_vision(); }
         workspace_bytes = plan_workspace();
         if (tower) { workspace_bytes = std::max(workspace_bytes, tower->workspace_bytes()); }
@@ -1280,6 +1344,7 @@ struct Executor::Impl {
     // ---- Growing caches --------------------------------------------------------------------------
 
     [[nodiscard]] std::size_t unbacked() const {
+        if (paged) { return 0; } // the pool's pages are committed, not reserved
         std::size_t bytes = 0;
         for (const KvArea* area : sequence_areas) {
             if (area->region) { bytes += area->region.bytes() - area->region.mapped_bytes(); }
@@ -1289,7 +1354,13 @@ struct Executor::Impl {
 
     void count_backed() {
         std::uint64_t bytes = kv_fixed;
-        for (const KvArea* area : sequence_areas) { bytes += area->region.mapped_bytes(); }
+        if (paged) {
+            const std::uint32_t groups = pool != nullptr ? pool->allocated_pages() : 0;
+            pages_in_use.store(groups, std::memory_order_relaxed);
+            bytes += std::uint64_t(groups) * page_group_bytes;
+        } else {
+            for (const KvArea* area : sequence_areas) { bytes += area->region.mapped_bytes(); }
+        }
         kv_backed.store(bytes, std::memory_order_relaxed);
     }
 
@@ -1338,8 +1409,15 @@ struct Executor::Impl {
     }
 
     // Before a call that writes or reads `sequence`'s positions below `end`: its full-attention
-    // rows are backed up to the 256-slot tile that holds `end`. Outside capture.
+    // rows are backed up to the 256-slot tile that holds `end` (dense, elastic), or the lane's
+    // page groups through `end` are leased and its table row published (paged). Outside capture.
     void back(std::uint32_t sequence, std::uint32_t end) {
+        if (paged) {
+            materialize_pages(sequence,
+                              std::uint32_t((std::uint64_t(end) + kPagedKVPageSize - 1) /
+                                            kPagedKVPageSize));
+            return;
+        }
         if (!growing) { return; }
         const auto slots = std::uint32_t(round_up(end, 256));
         std::size_t need = 0;
@@ -1367,11 +1445,102 @@ struct Executor::Impl {
     }
 
     void release(std::uint32_t sequence) {
+        if (paged) {
+            if (page_leases.empty() || page_leases[sequence].empty()) { return; }
+            CUDA_CHECK(ninfer::wait_for_stream(stream));
+            pool->dematerialize(page_reservations[sequence], 0, page_leases[sequence]);
+            pool->resize_reservation(page_reservations[sequence], 0);
+            count_backed();
+            return;
+        }
         if (!growing || sequence_areas.empty() || sequence_areas.front()->backed[sequence] == 0) { return; }
         CUDA_CHECK(ninfer::wait_for_stream(stream));
         for (KvArea* area : sequence_areas) { trim(*area, sequence, 0); }
         count_backed();
         delivery->grow_cache();
+    }
+
+    // Leases the lane's page groups up to `groups` positions and publishes its table row. The
+    // lanes' reservations come from admission, which refuses in the queue what the pool cannot
+    // hold; a call that outgrows its grant extends it, failing cleanly rather than writing into
+    // a page another lane holds.
+    void materialize_pages(std::uint32_t sequence, std::uint32_t groups) {
+        if (groups == 0 || groups <= page_leases[sequence].size()) { return; }
+        auto& leases = page_leases[sequence];
+        if (leases.capacity() < groups) { leases.reserve(groups); }
+        auto& reservation = page_reservations[sequence];
+        if (reservation.pages() < groups) {
+            if (!pool->can_resize_reservation(reservation, groups)) {
+                count_backed();
+                throw InsufficientMemory(
+                    "Inkling 2: the page pool cannot extend sequence " +
+                    std::to_string(sequence) + " to " +
+                    std::to_string(std::uint64_t(groups) * kPagedKVPageSize) + " positions");
+            }
+            pool->resize_reservation(reservation, groups);
+        }
+        pool->materialize(reservation, groups, page_leases[sequence]);
+        tables->publish(execution_rows[sequence].handle(), 0, page_leases[sequence],
+                        RankStreams(stream));
+        count_backed();
+    }
+
+    // Whether the sequence may grow to `tokens` positions: reserves that many page groups beside
+    // the other sequences' grants.
+    [[nodiscard]] bool reserve_pages_impl(std::uint32_t sequence, std::uint32_t tokens) {
+        if (!paged) { return true; }
+        const std::uint32_t groups = std::uint32_t(
+            (std::uint64_t(tokens) + kPagedKVPageSize - 1) / kPagedKVPageSize);
+        if (groups <= page_reservations[sequence].pages()) { return true; }
+        if (!pool->can_resize_reservation(page_reservations[sequence], groups)) { return false; }
+        pool->resize_reservation(page_reservations[sequence], groups);
+        return true;
+    }
+
+    // The pool of the eight full-attention visits' planes: one page group is 64 positions of
+    // every visit's K codes, K scales, V codes and V scales (visit order), page-major, and the
+    // execution tables hold one row per sequence. One backing holds both.
+    void build_pool() {
+        const auto plane = [&](DType dtype, std::int32_t leading) {
+            return KVPlaneGeometry{dtype, leading, kv_heads, 256, 1, 0};
+        };
+        const std::int32_t key_code = kv_code_bytes(kvfmt.key.coding);
+        const std::int32_t value_code = kv_code_bytes(kvfmt.value.coding);
+        KVPageGeometry geometry;
+        geometry.page_tokens        = kPagedKVPageSize;
+        geometry.device_plane_order = PagedKVPlaneOrder::PageMajor;
+        for (const VisitPlan& p : visits) {
+            if (!p.full) { continue; }
+            geometry.planes.push_back(
+                plane(kvfmt.key.coding == KvCoding::Int8G64 ? DType::I8 : DType::U8, key_code));
+            geometry.planes.push_back(plane(DType::FP16, kv_scale_bytes(kvfmt.key.coding) / 2));
+            geometry.planes.push_back(plane(DType::U8, value_code));
+            geometry.planes.push_back(plane(DType::FP16, kv_scale_bytes(kvfmt.value.coding) / 2));
+        }
+        LayoutBuilder builder;
+        const auto pool_layout = plan_device_kv_page_pool(
+            builder, {.page_group_count = pool_pages, .geometry = std::move(geometry)});
+        const auto tables_layout = plan_kv_execution_tables(
+            builder, {.logical_page_capacity = lane_pages,
+                      .table_rows            = std::int32_t(options.sequences)});
+        const std::size_t bytes = builder.finish(256);
+        pool_buffer             = std::make_unique<DeviceBuffer>(bytes);
+        pool                    = std::make_unique<DeviceKVPagePool>(
+            DeviceSpan{pool_buffer->p, bytes}, pool_layout);
+        tables = std::make_unique<KVExecutionTablePool>(DeviceSpan{pool_buffer->p, bytes},
+                                                        tables_layout, *pool);
+        execution_rows.resize(options.sequences);
+        page_leases.resize(options.sequences);
+        page_reservations.clear();
+        for (std::uint32_t s = 0; s < options.sequences; ++s) {
+            execution_rows[s] = tables->acquire(int(s));
+            page_leases[s].reserve(lane_pages); // materialize may not allocate
+            page_reservations.push_back(pool->make_empty_reservation());
+        }
+        host_page_layout = plan_host_kv_page_layout(pool_layout.spec.geometry);
+        page_group_bytes = host_page_layout.page_stride;
+        kv_bytes += bytes;
+        count_backed();
     }
 
     std::size_t start_reserve() const {
@@ -2259,10 +2428,13 @@ struct Executor::Impl {
         kernels::kv_post(ka, stream);
         KvPlaneView k_view, v_view; // a quantized full visit's planes, else null codings
         if (quantized) {
-            const auto view = [&](const KvArea& codes, const KvArea& scales, KvCoding coding) {
+            const auto view = [&](const KvArea& codes, const KvArea& scales, KvCoding coding,
+                                  int pool_plane) {
                 KvPlaneView plane;
-                plane.codes   = static_cast<std::uint8_t*>(codes.p);
-                plane.scales  = static_cast<std::uint8_t*>(scales.p);
+                plane.codes   = paged ? static_cast<std::uint8_t*>(pool->plane(std::size_t(pool_plane)).data)
+                                      : static_cast<std::uint8_t*>(codes.p);
+                plane.scales  = paged ? static_cast<std::uint8_t*>(pool->plane(std::size_t(pool_plane) + 1).data)
+                                      : static_cast<std::uint8_t*>(scales.p);
                 plane.code_row  = kv_code_bytes(coding);
                 plane.scale_row = kv_scale_bytes(coding);
                 plane.code_head  = std::int64_t(vp.slots) * plane.code_row;
@@ -2270,10 +2442,18 @@ struct Executor::Impl {
                 plane.code_seq  = plane.code_head * kv_heads;
                 plane.scale_seq = plane.scale_head * kv_heads;
                 plane.coding    = coding;
+                if (paged) {
+                    plane.block_table  = static_cast<const std::int32_t*>(tables->matrix().data);
+                    plane.table_stride = lane_pages;
+                    plane.heads        = kv_heads;
+                    plane.page_tokens  = kPagedKVPageSize;
+                    plane.code_page    = std::int64_t(plane.page_tokens) * kv_heads * plane.code_row;
+                    plane.scale_page   = std::int64_t(plane.page_tokens) * kv_heads * plane.scale_row;
+                }
                 return plane;
             };
-            k_view = view(vp.k_codes, vp.k_scales, kvfmt.key.coding);
-            v_view = view(vp.v_codes, vp.v_scales, kvfmt.value.coding);
+            k_view = view(vp.k_codes, vp.k_scales, kvfmt.key.coding, vp.pool_plane);
+            v_view = view(vp.v_codes, vp.v_scales, kvfmt.value.coding, vp.pool_plane + 2);
             for (const auto& [src, plane] :
                  {std::pair{ka.k_cache, k_view}, std::pair{ka.v_cache, v_view}}) {
                 kernels::KvStoreArgs store;
@@ -2995,11 +3175,19 @@ struct Executor::Impl {
 
     [[nodiscard]] std::uint64_t image_bytes(std::uint32_t position) const {
         std::uint64_t bytes = sequence_history_bytes();
-        for (const VisitPlan* p : cache_plans()) {
-            if (p->full) {
-                bytes += 2 * std::uint64_t(kv_heads) * position * kD * sizeof(__half);
-            } else {
-                for (const auto& r : ring_buffers(*p, 0)) { bytes += r.second; }
+        if (paged) {
+            bytes += std::uint64_t((position + kPagedKVPageSize - 1) / kPagedKVPageSize) *
+                     host_page_layout.page_stride;
+            for (const VisitPlan* p : cache_plans()) {
+                if (!p->full) { for (const auto& r : ring_buffers(*p, 0)) { bytes += r.second; } }
+            }
+        } else {
+            for (const VisitPlan* p : cache_plans()) {
+                if (p->full) {
+                    bytes += 2 * std::uint64_t(kv_heads) * position * kD * sizeof(__half);
+                } else {
+                    for (const auto& r : ring_buffers(*p, 0)) { bytes += r.second; }
+                }
             }
         }
         if (spark) { bytes += spark_context_bytes(); }
@@ -3026,35 +3214,70 @@ struct Executor::Impl {
                 at += in_page;
             }
         };
-        const std::size_t head_bytes = std::size_t(global_slots) * kD * sizeof(__half);
-        for (const VisitPlan* p : cache_plans()) {
-            if (p->full) {
-                if (p->k_codes.p != nullptr) {
-                    for (const KvArea* area :
-                         {&p->k_codes, &p->k_scales, &p->v_codes, &p->v_scales}) {
-                        auto* base = static_cast<std::uint8_t*>(area->p) +
-                                     sequence * area->row_bytes * kv_heads;
-                        for (int h = 0; h < kv_heads; ++h) {
-                            copy(base + h * area->row_bytes,
-                                 std::size_t(position) * area->position_bytes);
-                        }
-                    }
-                    continue;
-                }
-                for (const KvArea* area : {&p->k, &p->v}) {
-                    auto* base = static_cast<std::uint8_t*>(area->p) + sequence * head_bytes * kv_heads;
-                    for (int h = 0; h < kv_heads; ++h) {
-                        copy(base + h * head_bytes, std::size_t(position) * kD * sizeof(__half));
-                    }
-                }
-                continue;
-            }
+        const auto copy_rings = [&](const VisitPlan* p) {
             const auto rings = ring_buffers(*p, sequence);
             for (std::size_t i = 0; i < rings.size(); ++i) {
                 std::uint8_t* device =
                     checkpoint ? static_cast<std::uint8_t*>(p->checkpoint[i].p) + sequence * rings[i].second
                                : rings[i].first;
                 copy(device, rings[i].second);
+            }
+        };
+        if (paged) {
+            // The eight visits' rows as whole page-group records first (every visit's planes
+            // move together, one record per 64 positions); the rings, histories and the rest
+            // keep the dense stream after them.
+            const std::uint32_t groups = std::uint32_t(
+                (std::uint64_t(position) + kPagedKVPageSize - 1) / kPagedKVPageSize);
+            if (groups > 0) {
+                std::vector<std::byte*> records(groups);
+                std::vector<std::uint32_t> record_groups(groups, 0);
+                for (std::uint32_t g = 0; g < groups; ++g) {
+                    const std::size_t offset = std::size_t(g) * host_page_layout.page_stride;
+                    records[g] = pages[offset / page_bytes] + offset % page_bytes;
+                }
+                std::vector<DeviceKVPageHandle> handles;
+                handles.reserve(groups);
+                for (std::uint32_t g = 0; g < groups; ++g) {
+                    handles.push_back(page_leases[sequence][g].handle());
+                }
+                if (save) {
+                    pool->copy_to_host_records(handles, records, record_groups, host_page_layout,
+                                               RankStreams(stream));
+                } else {
+                    pool->copy_from_host_records(records, record_groups, handles, host_page_layout,
+                                                 RankStreams(stream));
+                }
+            }
+            at = std::size_t(groups) * host_page_layout.page_stride;
+            for (const VisitPlan* p : cache_plans()) {
+                if (!p->full) { copy_rings(p); }
+            }
+        } else {
+            const std::size_t head_bytes = std::size_t(global_slots) * kD * sizeof(__half);
+            for (const VisitPlan* p : cache_plans()) {
+                if (p->full) {
+                    if (p->k_codes.p != nullptr) {
+                        for (const KvArea* area :
+                             {&p->k_codes, &p->k_scales, &p->v_codes, &p->v_scales}) {
+                            auto* base = static_cast<std::uint8_t*>(area->p) +
+                                         sequence * area->row_bytes * kv_heads;
+                            for (int h = 0; h < kv_heads; ++h) {
+                                copy(base + h * area->row_bytes,
+                                     std::size_t(position) * area->position_bytes);
+                            }
+                        }
+                        continue;
+                    }
+                    for (const KvArea* area : {&p->k, &p->v}) {
+                        auto* base = static_cast<std::uint8_t*>(area->p) + sequence * head_bytes * kv_heads;
+                        for (int h = 0; h < kv_heads; ++h) {
+                            copy(base + h * head_bytes, std::size_t(position) * kD * sizeof(__half));
+                        }
+                    }
+                    continue;
+                }
+                copy_rings(p);
             }
         }
         if (spark) {
@@ -3124,7 +3347,10 @@ const ExecutorOptions& Executor::options() const noexcept { return impl_->option
 ExecutorMemory Executor::memory() const noexcept {
     return ExecutorMemory{.kv_bytes        = impl_->kv_bytes,
                           .kv_backed_bytes = impl_->kv_backed.load(std::memory_order_relaxed),
-                          .kv_grows        = impl_->growing,
+                          .kv_grows        = impl_->growing || impl_->paged,
+                          .kv_page_group_bytes = impl_->page_group_bytes,
+                          .kv_pages        = impl_->pages_in_use.load(std::memory_order_relaxed),
+                          .kv_pages_max    = impl_->pool ? impl_->pool->capacity_pages() : 0,
                           .history_bytes   = impl_->history_bytes,
                           .workspace_bytes = impl_->workspace_bytes,
                           .vision_encode_bytes = impl_->tower ? impl_->tower->workspace_bytes() : 0,
@@ -3134,6 +3360,12 @@ ExecutorMemory Executor::memory() const noexcept {
                                                             : 0,
                           .experts = impl_->delivery ? impl_->delivery->memory() : ExpertDeliveryMemory{}};
 }
+
+bool Executor::reserve_pages(std::uint32_t sequence, std::uint32_t tokens) {
+    return impl_->reserve_pages_impl(sequence, tokens);
+}
+
+bool Executor::paged_kv() const noexcept { return impl_->paged; }
 
 std::uint32_t Executor::vocab() const noexcept { return std::uint32_t(impl_->vocab); }
 
