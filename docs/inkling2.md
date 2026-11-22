@@ -97,7 +97,7 @@ tokenization, the chat template, output parsing and the serving protocols.
 
 Not built for this family: MTP, DFlash, n-gram copy drafts and their archive, `--draft-confidence`,
 rotation scaling (the attention has no rotation), thinking budgets, video, pipeline stages, and of
-the context cache the shared paged KV pool, the disk tier and session slots. The quantized
+the context cache the disk tier and session slots. The quantized
 `--kv-dtype rk8v4` and `rk4v4` quantize the eight full-attention visits' planes (the windowed
 visits' rings, the convolution histories and a DSpark drafter's caches stay F16); the other
 quantized formats (`int8`, `fp8`, `nvfp4`, `k8v4`, `rk4v4-e8`, `rk2v4-e8`, `bf16p`) are not built.
@@ -188,6 +188,19 @@ sequence of 12,288 tokens plans 16.5 GiB of the GPU, 17.0 GiB with the drafter. 
 `--expert-residency host` the GPU keeps 1.6 GiB of weights (1.95 GiB with the drafter), two
 whole-layer banks of 1,337 MiB and a cache of as many experts as fit, and the host pins 13.1 GiB
 for the routed experts; `disk` reads them from the artifact through the OS page cache.
+
+### Paged full-attention planes
+
+`--kv-paging` (with `--kv-dtype rk8v4` or `rk4v4`) puts the eight full-attention visits' planes in
+one shared pool of 64-token page groups instead of dense per-sequence planes. A sequence leases
+page groups as it grows — uneven lane usage packs, so eight lanes of short prompts hold a fraction
+of the dense plan — and a request reserves `prompt + max_output` worth of groups at admission:
+what the pool cannot hold beside the other lanes waits in the queue (`pages used/capacity` of the
+capacity line reports the pool). The pool's size follows the free memory after the fixed caches,
+the workspace and the CUDA graphs, or `--kv-page-budget N` caps it in MiB. Off (the default) keeps
+the dense planes bit for bit. The windowed visits' rings, the convolution histories, the ring
+checkpoints and the DSpark drafter's caches stay outside the pool, and prefix reuse is unchanged:
+a prompt still resumes only where a state was kept (a sequence, a checkpoint or a host image).
 
 ## Prefix reuse
 
