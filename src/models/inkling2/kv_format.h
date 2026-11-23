@@ -8,9 +8,10 @@
 //   Int4G32   two signed 4-bit codes per byte, one FP16 scale per 32, FP16-RNE(absmax / 7)
 //   Lloyd4    4-bit Lloyd-Max indices with a G64 FP16 least-squares scale (rk4v4 keys)
 //
-// Only the eight full-attention visits quantize (rk8v4: Int8G64 keys and Int4G32 values; rk4v4:
-// Lloyd4 keys and Int4G32 values); the windowed visits' rings, the convolution histories and the
-// DSpark drafter's caches stay F16 whatever the flag says. Unlike Gemma 4's sliding blocks the
+// The visits' caches quantize alike (rk8v4: Int8G64 keys and Int4G32 values; rk4v4: Lloyd4 keys
+// and Int4G32 values): the eight full-attention visits' elastic planes and the forty windowed
+// visits' fixed sliding rings. The convolution histories and the DSpark drafter's caches stay F16
+// whatever the flag says. Unlike Gemma 4's sliding blocks the
 // rows here are stored unrotated: Inkling's K and V come out of their convolutions clipped and
 // RMS-normed, and Gemma 4's full-attention blocks store the same codings unrotated (its rk8v4
 // quality numbers cover exactly this). The codings otherwise need no rotation to reach their

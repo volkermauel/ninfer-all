@@ -98,8 +98,10 @@ tokenization, the chat template, output parsing and the serving protocols.
 Not built for this family: MTP, DFlash, n-gram copy drafts and their archive, `--draft-confidence`,
 rotation scaling (the attention has no rotation), thinking budgets, video, pipeline stages, and of
 the context cache the disk tier and session slots. The quantized
-`--kv-dtype rk8v4` and `rk4v4` quantize the eight full-attention visits' planes (the windowed
-visits' rings, the convolution histories and a DSpark drafter's caches stay F16); the other
+`--kv-dtype rk8v4` and `rk4v4` quantize every visit's planes — the eight full-attention visits'
+planes (elastic by default, the shared paged pool's with `--kv-paging`) and the windowed visits'
+fixed sliding rings (only the convolution histories and a
+DSpark drafter's caches stay F16); the other
 quantized formats (`int8`, `fp8`, `nvfp4`, `k8v4`, `rk4v4-e8`, `rk2v4-e8`, `bf16p`) are not built.
 DSpark drafts for one request at a
 time; with several requests decoding, each decodes a token a step.
@@ -184,7 +186,11 @@ ninfer-serve models/Inkling-2-Mini-UD-IQ4_XS-ninfer-v3.ninfer --model-id inkling
 With its experts on the GPU the model keeps 14.6 GiB of weights (15.0 GiB with the DSpark drafter)
 and 1.2 GiB of workspace, and a sequence's F16 keys and values take 32 KiB per token of context
 (its 8 full-attention visits) beside 224 MiB of sliding-window rings and convolution histories. One
-sequence of 12,288 tokens plans 16.5 GiB of the GPU, 17.0 GiB with the drafter. With
+sequence of 12,288 tokens plans 16.5 GiB of the GPU, 17.0 GiB with the drafter. The full-attention
+planes are elastic where CUDA VMM is available: sized for the whole context, but their physical
+pages back only the 256-slot tiles the sequences have reached, and startup admission demands the
+dense caches beside the workspace rather than the whole plan — a sequence whose next tile would
+exceed free VRAM fails its request instead. With
 `--expert-residency host` the GPU keeps 1.6 GiB of weights (1.95 GiB with the drafter), two
 whole-layer banks of 1,337 MiB and a cache of as many experts as fit, and the host pins 13.1 GiB
 for the routed experts; `disk` reads them from the artifact through the OS page cache.
