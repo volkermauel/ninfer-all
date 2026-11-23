@@ -16,7 +16,7 @@ import time
 
 HOST = "127.0.0.1"
 KEY = "sk-alliancemedicalrp"
-MODEL = "inkling-2-mini"
+MODEL = "inkling-2-mini"  # overridable: argv[6]
 
 PARA = ("The lighthouse keeper recorded the weather every hour in the station log. "
         "Wind speed and direction, barometric pressure, visibility and the state of the sea "
@@ -38,6 +38,8 @@ def main():
     max_tokens = int(sys.argv[4])
     prompt_tokens = int(sys.argv[5])
     timeout_s = int(sys.argv[6]) if len(sys.argv) > 6 else 300
+    if len(sys.argv) > 7 and sys.argv[7]:
+        globals()["MODEL"] = sys.argv[7]
 
     body = json.dumps({"model": MODEL,
                        "messages": [{"role": "user", "content": prompt_of(prompt_tokens)}],
@@ -95,7 +97,8 @@ def main():
     other_err = [r for r in results if not r.get("ok") and r.get("status") != 503
                  and not r.get("err")]
     gen = sum(r["pred_n"] for r in ok)
-    walls = sorted(r["wall_s"] for r in results)
+    walls = sorted(r.get("wall_s", 0) for r in results)
+    errs = [r.get("err", "") for r in results if r.get("err")][:3]
     p50 = walls[len(walls) // 2] if walls else 0
     p90 = walls[int(len(walls) * 0.9)] if walls else 0
     print(json.dumps({
@@ -104,9 +107,10 @@ def main():
         len([r for r in results if r.get("err")]),
         "agg_tok_s": round(gen / wall, 1) if wall else 0,
         "gen_tokens": gen, "wall_s": round(wall, 2),
-        "wall_mean_s": round(sum(r["wall_s"] for r in results) / max(1, len(results)), 2),
+        "wall_mean_s": round(sum(r.get("wall_s", 0) for r in results) / max(1, len(results)), 2),
         "wall_p50_s": round(p50, 2), "wall_p90_s": round(p90, 2),
-    }, flush=True))
+        "errors": errs,
+    }), flush=True)
 
 
 if __name__ == "__main__":

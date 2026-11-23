@@ -1305,7 +1305,7 @@ struct Inkling2Core::Impl {
                         // Chunked admission first asks for the whole grant: when the pool
                         // holds it the lane never extends, and only a tight pool falls back
                         // to the first generation chunk.
-                        const std::uint32_t tokens = generation_grant_tokens(
+                        const std::uint32_t tokens = kv_queue::generation_grant_tokens(
                             prompt_n, output,
                             reserve_chunked ? reserve_chunk_for(reserve_gen_chunk) : 0U);
                         bool fits = instance.executor->reserve_pages(*best, full);
@@ -1397,7 +1397,7 @@ struct Inkling2Core::Impl {
             // runs covered and a pool that cannot hold it beside the other lanes refuses here,
             // at planning, rather than mid-flight.
             if (executor.paged_kv() &&
-                !executor.reserve_pages(s, generation_grant_tokens(
+                !executor.reserve_pages(s, kv_queue::generation_grant_tokens(
                                                prompt_n,
                                                effective_output_capacity(
                                                    r.options.execution.requested_output_tokens,
