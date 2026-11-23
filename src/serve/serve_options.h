@@ -100,6 +100,10 @@ struct ServeOptions {
     // --kv-page-budget caps the pool in MiB (0: sized from free memory).
     bool kv_paging                         = false;
     std::uint32_t kv_page_budget_mib       = 0;
+    // --kv-page-group: positions of one page group (a power-of-two divisor of the window).
+    std::uint32_t kv_page_group            = 64;
+    // --kv-page-dedup / --no-kv-page-dedup: content-addressed sharing of byte-identical groups.
+    bool kv_page_dedup                     = true;
     SpeculativeOptions speculative;
     bool ngram_native_sessions = false;
     ContextCacheOptions context_cache;

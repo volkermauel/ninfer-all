@@ -68,6 +68,10 @@ struct ExecutorOptions {
     // sliding window. Bigger groups trade coarser allocation granularity for smaller execution
     // tables and fewer of them.
     std::uint32_t paged_kv_page_tokens = kPagedKVPageSize;
+    // --kv-page-dedup: content-addressed sharing of byte-identical page groups across the lanes
+    // (a shared prompt prefix stores once), with copy-on-write on divergent writes. Off gives
+    // every lane its own pages.
+    bool paged_kv_dedup                = true;
     // Proposed tokens a verification may carry per sequence after its anchor (0: no
     // verification); a verification's rows, the anchors and drafts of all its sequences, are at
     // most 8.
@@ -105,6 +109,12 @@ struct ExecutorMemory {
     std::uint64_t kv_page_group_bytes = 0;
     std::uint32_t kv_pages            = 0;
     std::uint32_t kv_pages_max        = 0;
+    // --kv-page-dedup: page groups two or more lanes map now, and the group offers that have
+    // shared an existing page so far.
+    std::uint32_t kv_pages_shared     = 0;
+    std::uint64_t kv_dedup_hits       = 0;
+    std::uint64_t kv_dedup_offers     = 0;
+    std::uint64_t kv_dedup_collisions = 0;
     // The short convolutions' histories (and their checkpoints), inside kv_bytes.
     std::uint64_t history_bytes   = 0;
     std::uint64_t workspace_bytes = 0;

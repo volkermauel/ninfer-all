@@ -68,17 +68,26 @@ ninfer::EngineOptions engine_options(const char* artifact, bool paged) {
     return options;
 }
 
-// Three rounds of eight lanes: fresh, resumed (the same prompts) and shifted (new prompts, the
-// lanes trimmed and refilled).
+// Four rounds of eight lanes: fresh, resumed (the same prompts), shifted (new prompts, the
+// lanes trimmed and refilled) and one round whose lanes share a long leading prefix with
+// per-lane divergent suffixes (the dedup demonstration).
 std::vector<std::vector<std::string>> run_engine(ninfer::Engine& engine) {
-    std::vector<std::vector<std::string>> texts(3, std::vector<std::string>(8));
-    for (int round = 0; round < 3; ++round) {
+    std::vector<std::vector<std::string>> texts(4, std::vector<std::string>(8));
+    for (int round = 0; round < 4; ++round) {
         const int shift = round == 2 ? 40 : 0;
         std::vector<ninfer::GenerationSubmission> submissions;
         std::vector<ninfer::PreparedPrompt> prompts;
         prompts.reserve(8);
         for (int lane = 0; lane < 8; ++lane) {
-            prompts.push_back(engine.prepare(prompt(list_prompt(200 + lane * 5 + shift))));
+            std::string text;
+            if (round == 3) {
+                // A common ~1,100-token prefix, then each lane's own divergent question.
+                text = list_prompt(96) + " Lane " + std::to_string(lane) +
+                       " read this copy. Reply with the single word OK when you have read it.";
+            } else {
+                text = list_prompt(200 + lane * 5 + shift);
+            }
+            prompts.push_back(engine.prepare(prompt(text)));
             ninfer::GenerationSubmission submission;
             submission.prompt           = std::move(prompts.back());
             submission.options          = request(256);
@@ -114,7 +123,7 @@ int main() {
             // engines live in one process? No — the dense engine is destroyed first, the paging
             // one starts on a clean device; the comparison happens below over the saved texts.
             std::FILE* out = std::fopen("paged8-dense-expected.txt", "w");
-            for (int round = 0; round < 3; ++round) {
+            for (int round = 0; round < 4; ++round) {
                 for (int lane = 0; lane < 8; ++lane) {
                     std::fputs(texts[std::size_t(round)][std::size_t(lane)].c_str(), out);
                     std::fputc('\n', out);
@@ -132,7 +141,7 @@ int main() {
         check(in != nullptr, "the dense control's outputs were saved");
         if (in != nullptr) {
             char buffer[4096];
-            for (int round = 0; round < 3; ++round) {
+            for (int round = 0; round < 4; ++round) {
                 for (int lane = 0; lane < 8; ++lane) {
                     std::string expected = std::fgets(buffer, sizeof(buffer), in) != nullptr
                                                ? std::string(buffer)

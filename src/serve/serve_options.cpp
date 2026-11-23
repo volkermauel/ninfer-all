@@ -366,7 +366,11 @@ std::string serve_usage_text(const char* argv0) {
            "  --kv-page-budget N            the pool's device-byte ceiling in MiB (0: sized\n"
            "                                from free memory; default 0)\n"
            "  --kv-page-group N             positions of one page group, a power-of-two divisor\n"
-           "                                of the 1,024-position window (8..1024; default 64)\n" +
+           "                                of the 1,024-position window (8..1024; default 64)\n"
+           "  --kv-page-dedup / --no-kv-page-dedup\n"
+           "                                with --kv-paging: share byte-identical page groups\n"
+           "                                across the lanes (a shared prompt prefix stores\n"
+           "                                once); divergent writes copy first (default on)\n" +
            std::string(product::kKvResidentHelp) +
            "\n"
            "CONTEXT CACHE\n"
@@ -1344,6 +1348,10 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
         if (arg == "--kv-page-budget") {
             options.kv_page_budget_mib = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--kv-page-budget"), "kv-page-budget"));
+            continue;
+        }
+        if (product::switch_option(arg, "kv-page-dedup",
+                                   [&](bool on) { options.kv_page_dedup = on; })) {
             continue;
         }
         if (arg == "--kv-page-group") {

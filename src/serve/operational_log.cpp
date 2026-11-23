@@ -572,6 +572,17 @@ void OperationalLog::http_failure(std::string_view endpoint, const RequestFailur
 // one, where the capacity line's pages 0/0 stays).
 void OperationalLog::engine_pages(const ninfer::MemorySummary& memory) const {
     if (memory.kv_capacity_max_page_groups == 0) { return; }
+    if (memory.kv_shared_page_groups != 0 || memory.kv_dedup_hits != 0) {
+        logger_->info("pages | {}/{} page groups in use ({} shared, {} hits, {} offers, "
+                      "{} collisions)",
+                      product::format_pretty_count(memory.kv_capacity_page_groups),
+                      product::format_pretty_count(memory.kv_capacity_max_page_groups),
+                      product::format_pretty_count(memory.kv_shared_page_groups),
+                      product::format_pretty_count(memory.kv_dedup_hits),
+                      product::format_pretty_count(memory.kv_dedup_offers),
+                      product::format_pretty_count(memory.kv_dedup_collisions));
+        return;
+    }
     logger_->info("pages | {}/{} page groups in use",
                   product::format_pretty_count(memory.kv_capacity_page_groups),
                   product::format_pretty_count(memory.kv_capacity_max_page_groups));

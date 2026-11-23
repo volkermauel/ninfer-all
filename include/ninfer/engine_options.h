@@ -644,6 +644,9 @@ struct EngineOptions {
     // Inkling 2 with --kv-paging: positions of one page group (--kv-page-group), a power-of-two
     // divisor of the model's sliding window. 64 keeps the landed shape.
     std::uint32_t kv_page_group        = 64;
+    // Inkling 2 with --kv-paging: content-addressed sharing of byte-identical page groups across
+    // the lanes (a shared prompt prefix stores once), with copy-on-write on divergent writes.
+    bool kv_page_dedup                 = true;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;

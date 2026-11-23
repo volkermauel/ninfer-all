@@ -310,6 +310,8 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.kv_cache                 = options.kv_cache;
     engine_options.kv_paging                = options.kv_paging;
     engine_options.kv_page_budget_mib       = options.kv_page_budget_mib;
+    engine_options.kv_page_group            = options.kv_page_group;
+    engine_options.kv_page_dedup            = options.kv_page_dedup;
     engine_options.enable_vision            = options.enable_vision;
     engine_options.grafts                   = options.grafts;
     options.steering.apply(engine_options);

@@ -236,6 +236,7 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
     executor.cuda_graphs   = options.use_cuda_graph;
     executor.kv_cache      = options.kv_cache;
     executor.paged_kv      = options.kv_paging;
+    executor.paged_kv_dedup = options.kv_page_dedup;
     if (options.kv_paging && options.kv_page_budget_mib != 0) {
         executor.paged_kv_budget_bytes = std::uint64_t(options.kv_page_budget_mib) << 20;
     }
@@ -3000,6 +3001,10 @@ MemorySummary Inkling2Core::memory_summary() const {
     // --kv-paging: the pool's page groups, in use and at capacity.
     out.kv_capacity_page_groups     = memory.kv_pages;
     out.kv_capacity_max_page_groups = memory.kv_pages_max;
+    out.kv_shared_page_groups       = memory.kv_pages_shared;
+    out.kv_dedup_hits               = memory.kv_dedup_hits;
+    out.kv_dedup_offers             = memory.kv_dedup_offers;
+    out.kv_dedup_collisions         = memory.kv_dedup_collisions;
     out.host_kv_capacity_bytes = impl_->host_budget;
     {
         std::lock_guard lock(impl_->stats_mutex);

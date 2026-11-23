@@ -136,6 +136,10 @@ int main() {
     }
     failures += check(parse({"ninfer-serve", "model.ninfer"}).kv_page_group == 64,
                       "the page-group default is not the landed 64");
+    failures += check(parse({"ninfer-serve", "model.ninfer"}).kv_page_dedup &&
+                          !parse({"ninfer-serve", "model.ninfer", "--no-kv-page-dedup"})
+                               .kv_page_dedup,
+                      "the page-group dedup default or its opt-out broke");
     for (const auto* group : {"0", "48", "100", "2048", "-64", "3", "x"}) {
         bool rejected = false;
         try {

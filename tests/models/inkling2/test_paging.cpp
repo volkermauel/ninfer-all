@@ -15,6 +15,7 @@
 #include "cuda_availability.h"
 #include "models/inkling2/kernels.h"
 #include "models/inkling2/kv_planes.h"
+#include "models/inkling2/page_dedup.h"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -36,6 +37,7 @@ namespace {
 using namespace ninfer;
 namespace k  = ninfer::models::inkling2::kernels;
 namespace mi = ninfer::models::inkling2;
+namespace pd = ninfer::models::inkling2::page_dedup;
 using bf16   = __nv_bfloat16;
 
 constexpr int kHeads = 24, kKv = 8, kD = 128, kRel = 16;
@@ -268,6 +270,177 @@ std::vector<std::int32_t> table_row(const Paged& paged, const KVExecutionRowLeas
           "table row read");
     return entries;
 }
+
+// One visit's K codes of a page group, read through the plane at `handle`.
+std::vector<std::uint8_t> page_key_codes(const Paged& paged, DeviceKVPageHandle handle) {
+    const KVPlaneByteRange range = paged.pool->plane_page_range(0, handle);
+    std::vector<std::uint8_t> bytes(range.bytes);
+    check(cudaMemcpy(bytes.data(), range.base, range.bytes, cudaMemcpyDeviceToHost),
+          "page key codes read");
+    return bytes;
+}
+
+// --kv-page-dedup: two lanes store a byte-identical group, the second maps the first's page
+// (verified byte for byte), a forced hash collision keeps the lane's own page, a divergent write
+// copies first, and the last reference out frees the page.
+void exercise_sharing() {
+    const VisitSizes s = visit_sizes(mi::KvCoding::Lloyd4, mi::KvCoding::Int4G32);
+    const int lanes = 2, groups_per_lane = 2;
+    const int fill_slots = groups_per_lane * g_page;
+    Paged paged = make_paged(lanes * groups_per_lane, lanes, groups_per_lane,
+                             mi::KvCoding::Lloyd4, mi::KvCoding::Int4G32);
+    std::mt19937 rng(4242);
+    std::normal_distribution<float> n(0.0f, 1.0f);
+
+    // Both lanes' rows, one lease and one group view per logical group.
+    std::vector<std::vector<DeviceKVPageLease>> leases(lanes);
+    std::vector<std::vector<pd::LaneGroup>> groups(lanes);
+    std::vector<std::optional<DeviceKVPageReservation>> grants(lanes);
+    std::vector<KVExecutionRowLease> rows(lanes);
+    auto publish = [&](int lane) {
+        std::vector<DeviceKVPageHandle> handles;
+        for (const pd::LaneGroup& group : groups[lane]) { handles.push_back(group.mapped); }
+        paged.tables->publish(rows[lane].handle(), 0, handles);
+    };
+    for (int lane = 0; lane < lanes; ++lane) {
+        grants[lane] = paged.pool->reserve(groups_per_lane);
+        rows[lane]   = paged.tables->acquire(lane);
+        for (int g = 0; g < groups_per_lane; ++g) {
+            DeviceKVPageLease lease = paged.pool->materialize_one(*grants[lane]);
+            groups[lane].push_back(pd::LaneGroup{.mapped = lease.handle(),
+                                                         .shared = std::nullopt});
+            leases[lane].push_back(std::move(lease));
+        }
+        publish(lane);
+    }
+
+    // Group 0 of both lanes stores the SAME staged halves (byte-identical quantized planes);
+    // lane 1's group 1 stores different halves, so only group 0 can share.
+    std::vector<__half> ks(std::size_t(kKv) * fill_slots * kD), vs(ks.size());
+    for (auto& v : ks) { v = __float2half(1.5f * n(rng)); }
+    for (auto& v : vs) { v = __float2half(n(rng)); }
+    std::vector<__half> ks2(std::size_t(kKv) * g_page * kD), vs2(ks2.size());
+    for (auto& v : ks2) { v = __float2half(2.5f * n(rng)); }
+    for (auto& v : vs2) { v = __float2half(2.0f * n(rng)); }
+    // The staged halves upload to the device: the kernel reads src as device memory, and two
+    // lanes' stores of the same staged bytes must land byte-identical content.
+    DeviceBuffer ksrc = upload(ks), vsrc = upload(vs), ks2src = upload(ks2), vs2src = upload(vs2);
+    for (int lane = 0; lane < lanes; ++lane) {
+        RowsCase rc;
+        rc.chunk    = true;
+        rc.first    = 0;
+        rc.sequence = lane;
+        for (int i = 0; i < fill_slots; ++i) { rc.positions.push_back(i); }
+        RowsDevice rows_dev(rc);
+        if (lane == 0) {
+            store_rows(rows_dev.rows, as<__half>(ksrc), as<__half>(vsrc), fill_slots, s,
+                       mi::KvCoding::Lloyd4, mi::KvCoding::Int4G32, nullptr, nullptr, nullptr,
+                       nullptr, fill_slots, &paged);
+        } else {
+            // The shared group's bytes, then lane 1's own divergent group: the staging is
+            // [head][slot][dim], so the divergent slots replace slot g_page.. per head.
+            std::vector<__half> mixed_k(ks), mixed_v(vs);
+            const std::ptrdiff_t head_block = fill_slots * kD;
+            const std::ptrdiff_t divergent = std::ptrdiff_t(g_page) * kD;
+            for (int h = 0; h < kKv; ++h) {
+                std::copy(ks2.begin() + h * divergent, ks2.begin() + (h + 1) * divergent,
+                          mixed_k.begin() + h * head_block + divergent);
+                std::copy(vs2.begin() + h * divergent, vs2.begin() + (h + 1) * divergent,
+                          mixed_v.begin() + h * head_block + divergent);
+            }
+            DeviceBuffer kmixed = upload(mixed_k), vmixed = upload(mixed_v);
+            store_rows(rows_dev.rows, as<__half>(kmixed), as<__half>(vmixed), fill_slots, s,
+                       mi::KvCoding::Lloyd4, mi::KvCoding::Int4G32, nullptr, nullptr, nullptr,
+                       nullptr, fill_slots, &paged);
+        }
+    }
+    check(cudaDeviceSynchronize(), "sharing fills");
+    const std::vector<std::uint8_t> lane0_group0 = page_key_codes(paged, groups[0][0].mapped);
+    // Lane 0's identical group 0 enters the table; lane 1's identical offer verifies and maps
+    // the same physical page (its fresh page returns to the grant).
+    pd::PageSharing sharing;
+    const std::uint64_t hash = pd::hash_of_group(std::vector<std::int32_t>(g_page, 7), 0);
+    const pd::ShareOutcome first = pd::share_completed_group(
+        *paged.pool, sharing, hash, std::move(leases[0][0]), *grants[0], groups[0][0],
+        RankStreams(nullptr));
+    check(cudaDeviceSynchronize(), "lane 0's offer");
+    report(first == pd::ShareOutcome::entry_took_lease,
+           "dedup: the first owner's page entered the table");
+    const pd::ShareOutcome second = pd::share_completed_group(
+        *paged.pool, sharing, hash, std::move(leases[1][0]), *grants[1], groups[1][0],
+        RankStreams(nullptr));
+    check(cudaDeviceSynchronize(), "lane 1's offer");
+    publish(1);
+    const auto lane0_row = table_row(paged, rows[0]);
+    const auto lane1_row = table_row(paged, rows[1]);
+    report(second == pd::ShareOutcome::shared_onto_existing &&
+               lane1_row[0] == lane0_row[0] && paged.pool->allocated_pages() == 3,
+           "dedup: the byte-equal group mapped the first owner's page, its fresh page freed");
+    check(cudaDeviceSynchronize(), "lane 1's republished row");
+    report(page_key_codes(paged, groups[1][0].mapped) == lane0_group0,
+           "dedup: lane 1 reads the shared page's bytes through its own row");
+
+    // A forced collision: the same hash claimed for different bytes keeps the lane's page.
+    const pd::ShareOutcome collision = pd::share_completed_group(
+        *paged.pool, sharing, hash, std::move(leases[1][1]), *grants[1], groups[1][1],
+        RankStreams(nullptr));
+    check(cudaDeviceSynchronize(), "the collision offer");
+    report(collision == pd::ShareOutcome::kept_fresh &&
+               groups[1][1].shared == std::nullopt && leases[1][1].valid() &&
+               paged.pool->allocated_pages() == 3 && sharing.stats().collisions == 1,
+           "dedup: a hash match with different bytes kept the lane's own page");
+
+    // Copy-on-write: lane 1's write into the shared group copies to its own page first; lane 0's
+    // view keeps the original bytes.
+    std::vector<std::uint8_t> flipped(lane0_group0);
+    for (auto& byte : flipped) { byte ^= 0xA5; }
+    const std::uint64_t shared_hash = *groups[1][0].shared;
+    pd::copy_on_write_group(*paged.pool, sharing, shared_hash, *grants[1], leases[1][0],
+                            groups[1][0], RankStreams(nullptr));
+    check(cudaDeviceSynchronize(), "copy-on-write");
+    report(groups[1][0].shared == std::nullopt && leases[1][0].valid() &&
+               paged.pool->allocated_pages() == 4 && sharing.stats().copies == 1,
+           "dedup: the divergent write copied the shared group to the lane's own page");
+    report(page_key_codes(paged, groups[1][0].mapped) == lane0_group0 &&
+               page_key_codes(paged, groups[0][0].mapped) == lane0_group0,
+           "dedup: the copy starts from the shared bytes and the owner's page is untouched");
+    {
+        // The divergent write itself, onto the lane's own copy.
+        const KVPlaneByteRange range = paged.pool->plane_page_range(0, groups[1][0].mapped);
+        check(cudaMemcpy(const_cast<std::uint8_t*>(static_cast<const std::uint8_t*>(range.base)),
+                         flipped.data(), range.bytes, cudaMemcpyHostToDevice),
+              "divergent write staging");
+    }
+    publish(1);
+    check(cudaDeviceSynchronize(), "lane 1's row after the copy");
+    report(page_key_codes(paged, groups[1][0].mapped) == flipped,
+           "dedup: the copy holds the lane's divergent bytes");
+    report(page_key_codes(paged, groups[0][0].mapped) == lane0_group0,
+           "dedup: the first owner's page still holds the shared bytes");
+
+    // The lifecycle: each lane's release drops its reference; the last one frees the page.
+    for (int lane = 0; lane < lanes; ++lane) {
+        for (int g = 0; g < groups_per_lane; ++g) {
+            pd::LaneGroup& group = groups[lane][g];
+            if (group.shared.has_value()) {
+                DeviceKVPageLease retirable = sharing.unshare(*group.shared);
+                if (retirable.valid()) {
+                    paged.pool->dematerialize_one(*grants[lane], std::move(retirable));
+                }
+            } else if (leases[lane][g].valid()) {
+                paged.pool->dematerialize_one(*grants[lane], std::move(leases[lane][g]));
+            }
+            group                    = pd::LaneGroup{};
+            leases[lane][g]          = DeviceKVPageLease{};
+        }
+    }
+    check(cudaDeviceSynchronize(), "the releases");
+    report(paged.pool->allocated_pages() == 0 && sharing.groups() == 0 &&
+               sharing.stats().offers == 3 && sharing.stats().shared == 1,
+           "dedup: the last reference out freed the shared page");
+    for (KVExecutionRowLease& row : rows) { row.release(); }
+}
+
 
 // ---- The pool: leases, uneven lanes, admission, tables ------------------------------------------
 
@@ -511,9 +684,10 @@ void case_run(const char* name, mi::KvCoding key, mi::KvCoding value, std::mt199
         std::normal_distribution<float> n(0.0f, 1.0f);
         for (auto& v : ks) { v = __float2half(1.5f * n(rng)); }
         for (auto& v : vs) { v = __float2half(n(rng)); }
+        DeviceBuffer ksrc = upload(ks), vsrc = upload(vs);
         for (int which = 0; which < 2; ++which) {
-            store_rows(rows_dev.rows, ks.data(), vs.data(), fill_slots, s, key, value,
-                       as<std::uint8_t>(dense_kc), as<std::uint8_t>(dense_ks),
+            store_rows(rows_dev.rows, as<__half>(ksrc), as<__half>(vsrc), fill_slots, s, key,
+                       value, as<std::uint8_t>(dense_kc), as<std::uint8_t>(dense_ks),
                        as<std::uint8_t>(dense_vc), as<std::uint8_t>(dense_vs), fill_slots,
                        which == 1 ? &paged : nullptr);
         }
@@ -540,7 +714,7 @@ void case_run(const char* name, mi::KvCoding key, mi::KvCoding value, std::mt199
     // Decode rows of both lanes, then verification rows past them.
     {
         RowsCase rc;
-        rc.positions = {70, 140};
+        rc.positions = {fill_slots - 30, fill_slots - 26};
         rc.sequences = {0, 1};
         std::vector<__half> ks(std::size_t(kKv) * 2 * kD), vs(std::size_t(kKv) * 2 * kD);
         std::normal_distribution<float> n(0.0f, 1.0f);
@@ -551,7 +725,8 @@ void case_run(const char* name, mi::KvCoding key, mi::KvCoding value, std::mt199
     }
     {
         RowsCase rc;
-        rc.positions = {71, 72, 73, 141, 142, 143};
+        rc.positions = {fill_slots - 29, fill_slots - 28, fill_slots - 27,
+                        fill_slots - 25, fill_slots - 24, fill_slots - 23};
         rc.sequences = {0, 0, 0, 1, 1, 1};
         std::vector<__half> ks(std::size_t(kKv) * 6 * kD), vs(std::size_t(kKv) * 6 * kD);
         std::normal_distribution<float> n(0.0f, 1.0f);
@@ -582,6 +757,7 @@ int main() {
             g_page = page;
             std::cout << "-- page groups of " << page << " positions\n";
             std::mt19937 rng(20261121);
+            exercise_sharing();
             case_run("rk8v4 (int8 G64 keys, packed int4 G32 values)", mi::KvCoding::Int8G64,
                      mi::KvCoding::Int4G32, rng);
             case_run("rk4v4 (Lloyd-Max keys, packed int4 G32 values)", mi::KvCoding::Lloyd4,
