@@ -25,6 +25,7 @@
 
 #include "core/device.h"
 #include "core/expert_disk.h"
+#include "core/paged_kv_page.h"
 #include "core/tensor.h"
 #include "models/expert_profile.h"
 #include "models/inkling2/kv_format.h"
@@ -63,6 +64,10 @@ struct ExecutorOptions {
     bool paged_kv               = false;
     // The pool's device-byte ceiling (0: as much as the device frees beside the fixed caches).
     std::uint64_t paged_kv_budget_bytes = 0;
+    // Positions of one page group (--kv-page-group): a power-of-two divisor of the model's
+    // sliding window. Bigger groups trade coarser allocation granularity for smaller execution
+    // tables and fewer of them.
+    std::uint32_t paged_kv_page_tokens = kPagedKVPageSize;
     // Proposed tokens a verification may carry per sequence after its anchor (0: no
     // verification); a verification's rows, the anchors and drafts of all its sequences, are at
     // most 8.

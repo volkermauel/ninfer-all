@@ -641,6 +641,9 @@ struct EngineOptions {
     // The pool's device-byte ceiling in MiB (0: as much as the device frees beside the fixed
     // caches, the workspace and the CUDA graphs).
     std::uint32_t kv_page_budget_mib   = 0;
+    // Inkling 2 with --kv-paging: positions of one page group (--kv-page-group), a power-of-two
+    // divisor of the model's sliding window. 64 keeps the landed shape.
+    std::uint32_t kv_page_group        = 64;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;

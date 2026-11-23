@@ -262,6 +262,7 @@ struct Executor::Impl {
     std::vector<std::vector<DeviceKVPageLease>> page_leases; // per sequence, ascending positions
     std::vector<DeviceKVPageReservation> page_reservations;  // per sequence, the admission grant
     HostKVPageLayout host_page_layout{};
+    std::uint32_t page_tokens = kPagedKVPageSize; // positions of one page group (--kv-page-group)
     std::uint32_t lane_pages = 0;       // page groups a lane may reach (its full window)
     std::uint32_t pool_pages = 0;       // the pool's capacity
     std::uint64_t page_group_bytes = 0; // bytes of one group, all planes of all visits
@@ -335,6 +336,16 @@ struct Executor::Impl {
         const int device_id = device.rank(0).device;
         kvfmt = kv_format(options.kv_cache);
         paged   = options.paged_kv;
+        page_tokens = options.paged_kv_page_tokens;
+        if (paged) {
+            if (page_tokens == 0 || (page_tokens & (page_tokens - 1)) != 0 ||
+                page_tokens > config.sliding_window || config.sliding_window % page_tokens != 0) {
+                throw std::invalid_argument(
+                    "inkling2: --kv-page-group needs a power-of-two divisor of the model's "
+                    "sliding window of " + std::to_string(config.sliding_window) + " positions, got " +
+                    std::to_string(page_tokens));
+            }
+        }
         if (paged && !kvfmt.quantized()) {
             throw std::invalid_argument("inkling2: --kv-paging pools the quantized planes of the "
                                         "eight full-attention visits (--kv-dtype rk8v4 or rk4v4)");
@@ -401,16 +412,15 @@ struct Executor::Impl {
                                            plane_bytes(kvfmt.value.coding)) * std::size_t(sequences)
                 : 2 * std::size_t(kv_heads) * row_f16 * std::size_t(sequences);
         if (paged) { workspace_bytes = plan_workspace(); } // the pool's budget counts it
-        lane_pages = std::uint32_t((std::uint64_t(global_slots) + kPagedKVPageSize - 1) /
-                                   kPagedKVPageSize);
+        lane_pages = std::uint32_t((std::uint64_t(global_slots) + page_tokens - 1) / page_tokens);
         // One page group feeds every full-attention visit of every lane: its bytes cover the
-        // 64 positions' codes and scales of all the visits' planes.
+        // group's positions' codes and scales of all the visits' planes.
         std::uint32_t full_visit_count = 0;
         for (const auto& [layer, pass] : schedule) {
             full_visit_count += config.full_attention[layer] ? 1 : 0;
         }
         const std::uint64_t page_group =
-            paged ? std::uint64_t(kPagedKVPageSize) * kv_heads *
+            paged ? std::uint64_t(page_tokens) * kv_heads *
                         (plane_bytes(kvfmt.key.coding) + plane_bytes(kvfmt.value.coding)) *
                         full_visit_count
                   : 0;
@@ -1462,8 +1472,8 @@ struct Executor::Impl {
     void back(std::uint32_t sequence, std::uint32_t end) {
         if (paged) {
             materialize_pages(sequence,
-                              std::uint32_t((std::uint64_t(end) + kPagedKVPageSize - 1) /
-                                            kPagedKVPageSize));
+                              std::uint32_t((std::uint64_t(end) + page_tokens - 1) /
+                                            page_tokens));
             return;
         }
         if (!growing) { return; }
@@ -1528,7 +1538,7 @@ struct Executor::Impl {
                 throw InsufficientMemory(
                     "Inkling 2: the page pool cannot extend sequence " +
                     std::to_string(sequence) + " to " +
-                    std::to_string(std::uint64_t(groups) * kPagedKVPageSize) + " positions");
+                    std::to_string(std::uint64_t(groups) * page_tokens) + " positions");
             }
             pool->resize_reservation(reservation, needed);
         }
@@ -1543,7 +1553,7 @@ struct Executor::Impl {
     [[nodiscard]] bool reserve_pages_impl(std::uint32_t sequence, std::uint32_t tokens) {
         if (!paged) { return true; }
         const std::uint32_t groups = std::uint32_t(
-            (std::uint64_t(tokens) + kPagedKVPageSize - 1) / kPagedKVPageSize);
+            (std::uint64_t(tokens) + page_tokens - 1) / page_tokens);
         auto& reservation = page_reservations[sequence];
         // The lanes' held leases count toward their extent: a lane resuming its own retained
         // prefix needs only the delta past them.
@@ -1565,7 +1575,7 @@ struct Executor::Impl {
         const std::int32_t key_code = kv_code_bytes(kvfmt.key.coding);
         const std::int32_t value_code = kv_code_bytes(kvfmt.value.coding);
         KVPageGeometry geometry;
-        geometry.page_tokens        = kPagedKVPageSize;
+        geometry.page_tokens        = page_tokens;
         geometry.device_plane_order = PagedKVPlaneOrder::PageMajor;
         for (const VisitPlan& p : visits) {
             if (!p.full) { continue; }
@@ -2462,7 +2472,7 @@ struct Executor::Impl {
                 plane.block_table  = static_cast<const std::int32_t*>(tables->matrix().data);
                 plane.table_stride = lane_pages;
                 plane.heads        = kv_heads;
-                plane.page_tokens  = kPagedKVPageSize;
+                plane.page_tokens  = page_tokens;
                 plane.code_page    = std::int64_t(plane.page_tokens) * kv_heads * plane.code_row;
                 plane.scale_page   = std::int64_t(plane.page_tokens) * kv_heads * plane.scale_row;
             }
@@ -3300,15 +3310,12 @@ struct Executor::Impl {
     }
 
     [[nodiscard]] std::uint64_t image_bytes(std::uint32_t position) const {
-        constexpr std::size_t kImageSliceBytes = std::size_t(8) << 20;
-        const std::size_t records_per_slice =
-            paged ? kImageSliceBytes / host_page_layout.page_stride : 0;
         std::uint64_t bytes = sequence_history_bytes();
         if (paged) {
-            // Whole 8 MiB slices of page-group records, packed per slice.
+            // Whole page-group records, packed one after another across the host slices.
             const std::uint64_t groups =
-                (std::uint64_t(position) + kPagedKVPageSize - 1) / kPagedKVPageSize;
-            bytes += (groups + records_per_slice - 1) / records_per_slice * kImageSliceBytes;
+                (std::uint64_t(position) + page_tokens - 1) / page_tokens;
+            bytes += groups * host_page_layout.page_stride;
             for (const VisitPlan* p : cache_plans()) {
                 if (!p->full) { for (const auto& s : ring_spans(*p, 0)) { bytes += s.second; } }
             }
@@ -3355,52 +3362,24 @@ struct Executor::Impl {
             }
         };
         if (paged) {
-            constexpr std::size_t kImageSliceBytes = std::size_t(8) << 20;
-            const std::size_t records_per_slice =
-                kImageSliceBytes / host_page_layout.page_stride;
-            // The eight visits' rows as whole page-group records first (every visit's planes
-            // move together, one record per 64 positions), packed within whole 8 MiB host
-            // slices; the rings, histories and the rest keep the dense stream after them. A
-            // record never crosses a slice boundary, so a save or load touches only the image's
-            // own slices however the free list scatters them.
+            // The eight visits' rows as whole page-group records first (every visit's planes move
+            // together, one record per group), packed one after another across the host slices;
+            // the rings, histories and the rest keep the dense stream after them. Each record's
+            // planes are copied through the boundary-walking copy above, so a record may span
+            // slices (page groups at --kv-page-group 512 and above are bigger than one): a save
+            // or load touches only the image's own slices however the free list scatters them.
             const std::uint32_t groups = std::uint32_t(
-                (std::uint64_t(position) + kPagedKVPageSize - 1) / kPagedKVPageSize);
-            if (page_bytes != kImageSliceBytes) {
-                throw std::invalid_argument(
-                    "inkling2 paged image: host slices of 8 MiB are expected");
-            }
-            if (groups > 0) {
-                std::vector<std::byte*> records(groups);
-                for (std::uint32_t g = 0; g < groups; ++g) {
-                    records[g] = pages[g / records_per_slice] +
-                                 (g % records_per_slice) * host_page_layout.page_stride;
+                (std::uint64_t(position) + page_tokens - 1) / page_tokens);
+            for (std::uint32_t g = 0; g < groups; ++g) {
+                const std::size_t record_at = at;
+                for (std::size_t plane_index = 0; plane_index < pool->plane_count();
+                     ++plane_index) {
+                    const KVPlaneByteRange range = pool->plane_page_range(plane_index, int(g), 1);
+                    copy(const_cast<std::uint8_t*>(static_cast<const std::uint8_t*>(range.base)),
+                         range.bytes);
                 }
-                // One page group at a time, plain async copies per plane: a run of groups joined
-                // into one strided 2D copy crosses the image's host slices, and such runs are
-                // refused by the driver once the slices churn toward the pinned span's end.
-                // Group saves run on retire only, so the per-plane copies cost nothing on the
-                // critical path.
-                for (std::uint32_t g = 0; g < groups; ++g) {
-                    std::byte* record = records[g];
-                    for (std::size_t plane_index = 0; plane_index < pool->plane_count();
-                         ++plane_index) {
-                        const KVPlaneByteRange range =
-                            pool->plane_page_range(plane_index, int(g), 1);
-                        std::byte* host_ptr =
-                            record + host_page_layout.planes[plane_index].offset;
-                        if (save) {
-                            CUDA_CHECK(cudaMemcpyAsync(host_ptr, range.base, range.bytes,
-                                                       cudaMemcpyDeviceToHost, stream));
-                        } else {
-                            CUDA_CHECK(cudaMemcpyAsync(const_cast<void*>(range.base), host_ptr,
-                                                       range.bytes, cudaMemcpyHostToDevice,
-                                                       stream));
-                        }
-                    }
-                }
+                at = record_at + host_page_layout.page_stride; // the next record's own offset
             }
-            at = std::size_t((groups + records_per_slice - 1) / records_per_slice) *
-                 kImageSliceBytes;
             for (const VisitPlan* p : cache_plans()) {
                 if (!p->full) { copy_rings(p); }
             }

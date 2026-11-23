@@ -364,7 +364,9 @@ std::string serve_usage_text(const char* argv0) {
            "                                they grow; uneven lane usage packs, and requests\n"
            "                                that do not fit wait in the queue\n"
            "  --kv-page-budget N            the pool's device-byte ceiling in MiB (0: sized\n"
-           "                                from free memory; default 0)\n" +
+           "                                from free memory; default 0)\n"
+           "  --kv-page-group N             positions of one page group, a power-of-two divisor\n"
+           "                                of the 1,024-position window (8..1024; default 64)\n" +
            std::string(product::kKvResidentHelp) +
            "\n"
            "CONTEXT CACHE\n"
@@ -1342,6 +1344,17 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
         if (arg == "--kv-page-budget") {
             options.kv_page_budget_mib = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--kv-page-budget"), "kv-page-budget"));
+            continue;
+        }
+        if (arg == "--kv-page-group") {
+            const std::uint32_t group = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--kv-page-group"), "kv-page-group"));
+            if (group == 0 || (group & (group - 1)) != 0 || group > 1024 || 1024 % group != 0) {
+                throw std::invalid_argument(
+                    "--kv-page-group needs a power-of-two divisor of the 1,024-position window "
+                    "(8..1024), got " + std::to_string(group));
+            }
+            options.kv_page_group = group;
             continue;
         }
         if (arg == "--spec") {

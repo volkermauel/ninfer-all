@@ -40,7 +40,8 @@ using bf16   = __nv_bfloat16;
 
 constexpr int kHeads = 24, kKv = 8, kD = 128, kRel = 16;
 constexpr int kExtent = 1024;
-constexpr int kPage   = kPagedKVPageSize;
+// Positions of one page group under test (main sweeps them); the core's default stays 64.
+int g_page = kPagedKVPageSize;
 
 void check(cudaError_t status, const char* what) {
     if (status != cudaSuccess) {
@@ -84,7 +85,7 @@ std::vector<float> normal(std::size_t n, float sigma, std::mt19937& rng) {
 // One visit's four planes (K codes, K scales, V codes, V scales), page-major, 8 KV heads.
 KVPageGeometry visit_geometry(mi::KvCoding key, mi::KvCoding value) {
     KVPageGeometry geometry;
-    geometry.page_tokens        = kPage;
+    geometry.page_tokens        = g_page;
     geometry.device_plane_order = PagedKVPlaneOrder::PageMajor;
     const auto plane = [&](DType dtype, std::int32_t leading) {
         return KVPlaneGeometry{dtype, leading, kKv, 256, 1, 0};
@@ -180,9 +181,9 @@ mi::KvPlaneView paged_view(const Paged& paged, int plane_base, int cb, int sb, m
     view.block_table  = static_cast<const std::int32_t*>(paged.tables->matrix().data);
     view.table_stride = int(paged.lane_capacity);
     view.heads        = kKv;
-    view.page_tokens  = kPage;
-    view.code_page    = std::int64_t(kPage) * kKv * cb;
-    view.scale_page   = std::int64_t(kPage) * kKv * sb;
+    view.page_tokens  = g_page;
+    view.code_page    = std::int64_t(g_page) * kKv * cb;
+    view.scale_page   = std::int64_t(g_page) * kKv * sb;
     return view;
 }
 
@@ -368,13 +369,13 @@ void compare_stored(const char* name, const Paged& paged,
         check(cudaMemcpy(pool_scales.data(), scales_plane.data, pool_scales.size(),
                          cudaMemcpyDeviceToHost),
               "pool scales read");
-        const std::size_t page_code_bytes   = std::size_t(kPage) * kKv * std::size_t(cb);
-        const std::size_t page_scale_bytes  = std::size_t(kPage) * kKv * std::size_t(sb);
+        const std::size_t page_code_bytes   = std::size_t(g_page) * kKv * std::size_t(cb);
+        const std::size_t page_scale_bytes  = std::size_t(g_page) * kKv * std::size_t(sb);
         for (int lane = 0; lane < lanes; ++lane) {
             for (int slot = 0; slot < fill_slots; ++slot) {
                 const std::int32_t group =
-                    published[std::size_t(lane)][std::size_t(slot / kPage)];
-                const int in_group = slot % kPage;
+                    published[std::size_t(lane)][std::size_t(slot / g_page)];
+                const int in_group = slot % g_page;
                 for (int head = 0; head < kKv; ++head) {
                     // The dense planes' layout is [sequence][head][slot].
                     const std::size_t dense_at =
@@ -450,8 +451,8 @@ void compare_attention(const char* name, const char* kind, const Paged& paged, c
 // shapes, dense against paged.
 void case_run(const char* name, mi::KvCoding key, mi::KvCoding value, std::mt19937& rng) {
     const VisitSizes s = visit_sizes(key, value);
-    const int lanes = 2, fill_slots = 3 * kPage;
-    const std::uint32_t groups_per_lane = std::uint32_t(fill_slots / kPage);
+    const int lanes = 2, fill_slots = 3 * g_page;
+    const std::uint32_t groups_per_lane = std::uint32_t(fill_slots / g_page);
 
     Paged paged = make_paged(2 * groups_per_lane, lanes, groups_per_lane, key, value);
     DeviceBuffer dense_kc(std::size_t(lanes) * fill_slots * kKv * std::size_t(s.kc)),
@@ -575,11 +576,17 @@ int main() {
     check(cudaSetDevice(0), "device");
     try {
         exercise_pool();
-        std::mt19937 rng(20261121);
-        case_run("rk8v4 (int8 G64 keys, packed int4 G32 values)", mi::KvCoding::Int8G64,
-                 mi::KvCoding::Int4G32, rng);
-        case_run("rk4v4 (Lloyd-Max keys, packed int4 G32 values)", mi::KvCoding::Lloyd4,
-                 mi::KvCoding::Int4G32, rng);
+        // The landed 64-token groups and the sweep's other power-of-two divisors of the window:
+        // the tables and both kernels must hold bit for bit at every group size.
+        for (const int page : {kPagedKVPageSize, 32, 128, 1024}) {
+            g_page = page;
+            std::cout << "-- page groups of " << page << " positions\n";
+            std::mt19937 rng(20261121);
+            case_run("rk8v4 (int8 G64 keys, packed int4 G32 values)", mi::KvCoding::Int8G64,
+                     mi::KvCoding::Int4G32, rng);
+            case_run("rk4v4 (Lloyd-Max keys, packed int4 G32 values)", mi::KvCoding::Lloyd4,
+                     mi::KvCoding::Int4G32, rng);
+        }
     } catch (const std::exception& e) {
         std::cout << "FAIL  " << e.what() << '\n';
         return 1;

@@ -239,6 +239,7 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
     if (options.kv_paging && options.kv_page_budget_mib != 0) {
         executor.paged_kv_budget_bytes = std::uint64_t(options.kv_page_budget_mib) << 20;
     }
+    executor.paged_kv_page_tokens = options.kv_page_group;
     executor.draft_tokens  = dspine ? speculative.draft_tokens : lookup_drafts;
     executor.dspine        = dspine;
     executor.dspark        = dspark;

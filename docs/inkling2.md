@@ -203,7 +203,10 @@ page groups as it grows — uneven lane usage packs, so eight lanes of short pro
 of the dense plan — and a request reserves `prompt + max_output` worth of groups at admission:
 what the pool cannot hold beside the other lanes waits in the queue (`pages used/capacity` of the
 capacity line reports the pool). The pool's size follows the free memory after the fixed caches,
-the workspace and the CUDA graphs, or `--kv-page-budget N` caps it in MiB. Off (the default) keeps
+the workspace and the CUDA graphs, or `--kv-page-budget N` caps it in MiB. `--kv-page-group N`
+picks the positions of one page group — a power-of-two divisor of the 1,024-position window
+(8..1024): bigger groups trade coarser allocation granularity for smaller execution tables and
+fewer of them. Off (the default) keeps
 the dense planes bit for bit. The windowed visits' rings, the convolution histories, the ring
 checkpoints and the DSpark drafter's caches stay outside the pool, and prefix reuse is unchanged:
 a prompt still resumes only where a state was kept (a sequence, a checkpoint or a host image).
