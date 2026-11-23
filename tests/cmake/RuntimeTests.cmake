@@ -50,6 +50,10 @@ ninfer_add_test(ninfer_effective_thinking_budget_test
   STANDALONE
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_effective_thinking_budget.cpp")
 
+ninfer_add_test(ninfer_queue_policy_test
+  STANDALONE
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_queue_policy.cpp")
+
 ninfer_add_test(ninfer_engine_logprobs_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_engine_logprobs_real.cpp"
   LIBRARIES ninfer_engine)

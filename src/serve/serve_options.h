@@ -104,6 +104,12 @@ struct ServeOptions {
     std::uint32_t kv_page_group            = 64;
     // --kv-page-dedup / --no-kv-page-dedup: content-addressed sharing of byte-identical groups.
     bool kv_page_dedup                     = true;
+    // Inkling 2 paging queue: admission grant shape (--kv-reserve-mode upfront|chunked), the
+    // chunked grant's generation tokens (--kv-reserve-gen-chunk), and the admission order
+    // (--kv-queue-order fifo|shortest).
+    KvReserveMode kv_reserve_mode          = KvReserveMode::Upfront;
+    std::uint32_t kv_reserve_gen_chunk     = 256;
+    KvQueueOrder kv_queue_order            = KvQueueOrder::Fifo;
     SpeculativeOptions speculative;
     bool ngram_native_sessions = false;
     ContextCacheOptions context_cache;

@@ -106,6 +106,153 @@ std::vector<std::vector<std::string>> run_engine(ninfer::Engine& engine) {
     return texts;
 }
 
+// The queue-path scenarios: reserve modes, the extension guarantee, the queue order and the
+// queue deadline, each on its own engine.
+void run_queue_scenarios(const char* artifact) {
+    using KvReserveMode = ninfer::KvReserveMode;
+    using KvQueueOrder = ninfer::KvQueueOrder;
+
+    // Chunked reservations must not change outputs: the same four rounds as the dense
+    // control, granted in 64-token generation chunks.
+    std::vector<std::vector<std::string>> dense_texts;
+    {
+        ninfer::Engine control(engine_options(artifact, true));
+        dense_texts = run_engine(control);
+    }
+    {
+        auto options = engine_options(artifact, true);
+        options.kv_reserve_mode      = KvReserveMode::Chunked;
+        options.kv_reserve_gen_chunk = 64;
+        ninfer::Engine chunked(options);
+        const auto texts = run_engine(chunked);
+        bool same = true;
+        for (int round = 0; round < 4; ++round) {
+            for (int lane = 0; lane < 8; ++lane) {
+                same = same && texts[std::size_t(round)][std::size_t(lane)] ==
+                                     dense_texts[std::size_t(round)][std::size_t(lane)];
+            }
+        }
+        check(same, "chunked reservations produce the dense control's outputs byte for byte");
+    }
+
+    // The extension guarantee: a pool at its floor (80 MiB = 146 groups) and eight lanes
+    // generating 3,000 tokens each (47 groups a lane, 376 total) — chunked admits all eight
+    // and the lanes that cannot extend fail their own request while at least one completes;
+    // upfront admits about three and queues the rest to a clean timeout.
+    const auto generation_scenario = [&](KvReserveMode mode) {
+        ninfer::EngineOptions options = engine_options(artifact, true);
+        options.max_context           = 8192;
+        options.kv_reserve_mode       = mode;
+        options.kv_reserve_gen_chunk  = 64;
+        options.kv_page_budget_mib    = 80;
+        options.pending_timeout_ms    = 8000;
+        ninfer::Engine engine(options);
+        int completed = 0, failed = 0;
+        std::vector<ninfer::GenerationSubmission> submissions;
+        for (int lane = 0; lane < 8; ++lane) {
+            auto prepared = engine.prepare(prompt(list_prompt(20 + lane)));
+            ninfer::GenerationSubmission submission;
+            submission.prompt           = std::move(prepared);
+            submission.options          = request(3000);
+            submission.consumer_mode    = ninfer::OutputConsumerMode::Aggregate;
+            submission.pending_deadline = std::chrono::steady_clock::time_point::max();
+            submissions.push_back(std::move(submission));
+        }
+        auto handles = engine.submit_group(std::move(submissions));
+        for (auto& handle : handles) {
+            try {
+                const ninfer::GenerationResult result = handle.wait();
+                if (!result.content.empty() || result.finish_reason != ninfer::FinishReason::None) {
+                    ++completed;
+                }
+            } catch (const std::exception&) {
+                ++failed;
+            }
+        }
+        std::cout << "  " << (mode == KvReserveMode::Upfront ? "upfront" : "chunked")
+                  << ": completed " << completed << ", failed " << failed << '\n';
+        // The server-side engine keeps serving after any per-request failure.
+        const ninfer::GenerationResult probe =
+            engine.generate(engine.prepare(prompt(list_prompt(3))), request(4));
+        check(!probe.content.empty(),
+              std::string(mode == KvReserveMode::Upfront ? "upfront" : "chunked") +
+                  ": the engine keeps serving after per-request failures");
+        return completed;
+    };
+    std::cout << "extension guarantee at the pool floor\n";
+    const int upfront_completed    = generation_scenario(KvReserveMode::Upfront);
+    const int chunked_completed    = generation_scenario(KvReserveMode::Chunked);
+    check(chunked_completed > 0, "chunked: at least one lane rides out the tight pool");
+    check(upfront_completed + chunked_completed > 0,
+          "the tight pool still completes work in both modes");
+
+    // The queue order: one lane, a huge request submitted before a tiny one — shortest runs
+    // the tiny one first, so it completes while the huge request is still decoding.
+    const auto order_scenario = [&](KvQueueOrder order) {
+        ninfer::EngineOptions options = engine_options(artifact, true);
+        options.max_concurrency       = 1;
+        options.kv_queue_order        = order;
+        options.pending_timeout_ms    = 120000;
+        ninfer::Engine engine(options);
+        const auto huge_submit = std::chrono::steady_clock::now();
+        auto huge_handle = engine.submit(engine.prepare(prompt(list_prompt(300))),
+                                         request(256), ninfer::OutputConsumerMode::Aggregate, {},
+                                         std::chrono::steady_clock::time_point::max());
+        auto tiny_handle = engine.submit(engine.prepare(prompt(list_prompt(2))), request(1),
+                                         ninfer::OutputConsumerMode::Aggregate, {},
+                                         std::chrono::steady_clock::time_point::max());
+        const auto tiny_done = [&] {
+            tiny_handle.wait();
+            return std::chrono::steady_clock::now();
+        }();
+        huge_handle.wait();
+        return tiny_done < huge_submit + std::chrono::seconds(1);
+    };
+    check(order_scenario(KvQueueOrder::Shortest),
+          "shortest: a tiny request admitted behind a huge one completes first");
+    check(!order_scenario(KvQueueOrder::Fifo),
+          "fifo: the same tiny request waits behind the huge one");
+
+    // The queue deadline: a queued request whose deadline passes while the lane is busy
+    // expires with a clean QueueTimeout carrying a Retry-After; one with time left completes.
+    {
+        ninfer::EngineOptions options = engine_options(artifact, true);
+        options.max_concurrency       = 1;
+        options.pending_timeout_ms    = 120000;
+        ninfer::Engine engine(options);
+        auto busy = engine.submit(engine.prepare(prompt(list_prompt(300))), request(256),
+                                  ninfer::OutputConsumerMode::Aggregate, {},
+                                  std::chrono::steady_clock::time_point::max());
+        bool timed_out = false;
+        try {
+            auto queued = engine.submit(engine.prepare(prompt(list_prompt(4))), request(4),
+                                        ninfer::OutputConsumerMode::Aggregate, {},
+                                        std::chrono::steady_clock::now() +
+                                            std::chrono::seconds(1));
+            queued.wait();
+        } catch (const ninfer::RequestError& error) {
+            timed_out = error.kind() == ninfer::RequestErrorKind::QueueTimeout &&
+                        error.retry_after_seconds() >= 1;
+        }
+        check(timed_out, "a queued request expiring at its deadline answers QueueTimeout with "
+                         "a Retry-After");
+        busy.wait();
+        // A queued request admitted just inside its deadline completes.
+        bool inside_completed = false;
+        try {
+            auto queued = engine.submit(engine.prepare(prompt(list_prompt(4))), request(4),
+                                        ninfer::OutputConsumerMode::Aggregate, {},
+                                        std::chrono::steady_clock::now() +
+                                            std::chrono::seconds(120));
+            const ninfer::GenerationResult result = queued.wait();
+            inside_completed = result.finish_reason != ninfer::FinishReason::None;
+        } catch (const std::exception&) {
+            inside_completed = false;
+        }
+        check(inside_completed, "a queued request with deadline room completes");
+    }
+}
+
 } // namespace
 
 int main() {

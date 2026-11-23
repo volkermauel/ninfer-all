@@ -367,7 +367,22 @@ std::string serve_usage_text(const char* argv0) {
            "                                from free memory; default 0)\n"
            "  --kv-page-group N             positions of one page group, a power-of-two divisor\n"
            "                                of the 1,024-position window (8..1024; default 64)\n"
-           "  --kv-page-dedup / --no-kv-page-dedup\n"
+           "  --kv-reserve-mode upfront|chunked  Inkling 2 paging queue: admission grants\n"
+           "                                prompt + the whole max_tokens (upfront,\n"
+           "                                the default) or prompt + the first\n"
+           "                                --kv-reserve-gen-chunk tokens, extended\n"
+           "                                per decode round (more queued requests\n"
+           "                                fit the same budget; a lane whose\n"
+           "                                extension cannot be granted fails its\n"
+           "                                own request with a clean 503)\n"
+           "  --kv-reserve-gen-chunk N    chunked grant size in tokens (default 256)\n"
+           "  --kv-queue-order fifo|shortest  Inkling 2 paging queue admission order:\n"
+           "                                fifo (default, longest-waiting first) or\n"
+           "                                smallest prompt+max_tokens first\n"
+           "  --kv-queue-timeout-ms N     the paging queue deadline in ms (alias of\n"
+           "                                --pending-timeout-ms; expired requests\n"
+           "                                answer 503 with Retry-After)\n"
+"  --kv-page-dedup / --no-kv-page-dedup\n"
            "                                with --kv-paging: share byte-identical page groups\n"
            "                                across the lanes (a shared prompt prefix stores\n"
            "                                once); divergent writes copy first (default on)\n" +
@@ -1363,6 +1378,44 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
                     "(8..1024), got " + std::to_string(group));
             }
             options.kv_page_group = group;
+            continue;
+        }
+        if (arg == "--kv-reserve-mode") {
+            const std::string mode = require_value("--kv-reserve-mode");
+            if (mode == "upfront") {
+                options.kv_reserve_mode = KvReserveMode::Upfront;
+            } else if (mode == "chunked") {
+                options.kv_reserve_mode = KvReserveMode::Chunked;
+            } else {
+                throw std::invalid_argument(
+                    "invalid kv-reserve-mode: " + mode + " (upfront or chunked)");
+            }
+            continue;
+        }
+        if (arg == "--kv-reserve-gen-chunk") {
+            options.kv_reserve_gen_chunk = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--kv-reserve-gen-chunk"),
+                                      "kv-reserve-gen-chunk"));
+            continue;
+        }
+        if (arg == "--kv-queue-order") {
+            const std::string order = require_value("--kv-queue-order");
+            if (order == "fifo") {
+                options.kv_queue_order = KvQueueOrder::Fifo;
+            } else if (order == "shortest") {
+                options.kv_queue_order = KvQueueOrder::Shortest;
+            } else {
+                throw std::invalid_argument(
+                    "invalid kv-queue-order: " + order + " (fifo or shortest)");
+            }
+            continue;
+        }
+        if (arg == "--kv-queue-timeout-ms") {
+            // The paging queue's name for the pending deadline: the same budget, named for the
+            // queue path it bounds.
+            options.pending_timeout_ms = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--kv-queue-timeout-ms"),
+                                      "kv-queue-timeout-ms"));
             continue;
         }
         if (arg == "--spec") {
