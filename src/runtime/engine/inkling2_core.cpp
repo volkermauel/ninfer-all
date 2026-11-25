@@ -657,6 +657,7 @@ struct Inkling2Core::Impl {
     const std::uint32_t domain;
     const bool structured_output;
     const bool reuse_prefixes;
+    const bool shortest_queue;
     const std::uint32_t drafts;       // drafts a round; 0 without speculation
     const std::uint32_t lookup_ngram; // --lookup-ngram: tokens a context lookup matches; 0 is off
     const bool dspine;                // --spec dspine: the drafter proposes where no lookup does
@@ -667,7 +668,9 @@ struct Inkling2Core::Impl {
     // --draft-min-p: a drafter's round verifies through its first draft at or below this
     // probability.
     const float draft_floor;
-    // --adaptive-mtp with a block drafter: the drafts of a lone request's round, from how far its    const bool shortest_queue; // --kv-queue-order shortest: smallest queued request first    // drafts survive and the round times measured at each width; and the width of the round
+    // --kv-queue-order shortest: smallest queued request first.
+    // --adaptive-mtp with a block drafter: the drafts of a lone request's round, from how far its
+    // drafts survive and the round times measured at each width; and the width of the round
     // running (0 when it is not the controller's).
     std::optional<runtime::MtpAdaptiveBatchController> block_controller;
     std::uint32_t block_round_width = 0;

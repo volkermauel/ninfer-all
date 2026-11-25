@@ -15,6 +15,13 @@
 
 namespace ninfer::ops::kv128 {
 
+// Device-usable functions in this header carry the attributes when nvcc compiles.
+#if defined(__CUDACC__)
+#define NINFER_ROW128_HD __host__ __device__
+#else
+#define NINFER_ROW128_HD
+#endif
+
 using kv_row::KvCoding;
 
 // One row: one KV head's 128 values, so 128-wide blocks.
@@ -54,7 +61,7 @@ struct KvPlaneView {
 
 // Where a plane's row of (sequence, head, slot) begins: codes with the code strides and code
 // page bytes, scales with the scale ones.
-[[nodiscard]] inline std::int64_t kv_plane_offset(const KvPlaneView& plane, int sequence, int head,
+[[nodiscard]] NINFER_ROW128_HD inline std::int64_t kv_plane_offset(const KvPlaneView& plane, int sequence, int head,
                                                   int slot, std::int64_t seq_stride,
                                                   std::int64_t head_stride,
                                                   std::int64_t row_stride,
