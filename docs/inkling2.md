@@ -174,6 +174,7 @@ the context cache the shared paged KV pool; the server refuses their options at 
 `--kv-dtype` formats, MXFP8 (the default), `int8`, `rk8v4`, `rk4v4` and F16 (`bf16` or `fp16`) are
 built ([KV cache](#kv-cache)); `fp8`, `nvfp4`, `k8v4`, `rk4v4-e8`, `rk2v4-e8` and `bf16p` are not,
 for the reasons [Flint's KV cache](flint.md#kv-cache) lists. DSpark drafts for one request at a
+See [paged full-attention planes](#paged-full-attention-planes) for the shared pool (`--kv-paging`).
 time; with several requests decoding, each decodes a token a step.
 
 ## Converting
@@ -292,6 +293,37 @@ One such sequence plans 16.3 GiB of the GPU, 16.9 GiB with the drafter. With
 `--expert-residency host` the GPU keeps 1.57 GiB of weights (2.04 GiB with the drafter), two
 whole-layer banks of 1,337 MiB and a cache of as many experts as fit, and the host pins 13.1 GiB
 for the routed experts; `disk` reads them from the artifact through the OS page cache.
+
+### Paged full-attention planes
+
+`--kv-paging` (with `--kv-dtype rk8v4` or `rk4v4`) puts the eight full-attention visits' planes in
+one shared pool of 64-token page groups instead of dense per-sequence planes. A sequence leases
+page groups as it grows — uneven lane usage packs, so eight lanes of short prompts hold a fraction
+of the dense plan — and a request reserves `prompt + max_output` worth of groups at admission:
+what the pool cannot hold beside the other lanes waits in the queue (`pages used/capacity` of the
+capacity line reports the pool; the live stats line adds `N shared, H dedup hits` when sharing is
+active). The pool's size follows the free memory after the fixed caches,
+the workspace and the CUDA graphs, or `--kv-page-budget N` caps it in MiB. `--kv-page-group N`
+picks the positions of one page group — a power-of-two divisor of the 1,024-position window
+(8..1024): bigger groups trade coarser allocation granularity for smaller execution tables and
+fewer of them. Off (the default) keeps
+the dense planes bit for bit. The windowed visits' rings, the convolution histories, the ring
+checkpoints and the DSpark drafter's caches stay outside the pool, and prefix reuse is unchanged:
+a prompt still resumes only where a state was kept (a sequence, a checkpoint or a host image).
+
+### Shared page groups
+
+With `--kv-page-dedup` (the default), a completed page group's token ids — the group's positions
+and the tokens fed into them — hash (FNV-1a 64) into a content table. A hash match is verified
+byte for byte on the device before anything is shared, so neither a 64-bit collision nor a break
+of the same-tokens-store-identical-bytes premise can corrupt a page: a mismatch keeps the fresh
+page and is not inserted (keep-first). The shared page is reference-counted and the table owns
+its lease — the page returns to the pool when the last lane's reference drops — and a write into
+a shared group copies first (copy-on-write), so a divergent write never lands on a page another
+lane maps. Images read the lane's own mapping, and a saved image carries the bytes however they
+are shared. Sessions with the same leading tokens (a shared system prompt) store the prefix's
+groups once; the stats line's `N shared, H dedup hits` reports the saving. `--no-kv-page-dedup`
+gives every lane its own pages.
 
 ## Prefix reuse
 

@@ -5,8 +5,15 @@
 //    rows stored (a coding's own error bound); MXFP8's codes and scales equal the release's rule
 //    (vLLM's mxfp8_quantize) applied on the host, bit for bit;
 //  - attention over the planes: a full-attention visit's decode rows, verification rows, prompt
+<<<<<<< HEAD
 //    chunk, branches and a chunk with a far field against an FP64 attention over the host-decoded
 //    rows, the slots being the rows' physical positions.
+=======
+//    chunk and branches against an FP64 attention over the host-decoded rows, the slots being the
+//    rows' physical positions;
+//  - a sliding visit's ring of the same planes: stores and loads across the wrap-around seam and
+//    the windowed attention over the decoded ring (the slot of a key at position p is p % ring).
+>>>>>>> inkling2-paged-tuning
 
 #include "../../ops/kv_cache_lloyd4_oracle.h"
 #include "core/device_buffer.h"
@@ -451,6 +458,274 @@ void case_run(const char* name, mi::KvCoding key, mi::KvCoding value, const Rows
                num(attention_bound) + ")");
 }
 
+// A sliding visit's ring: R slots of positions p % R, the attention windowed to the W positions
+// before each row. Covers the wrap-around the full-attention cases cannot: kv_store into ring
+// planes across the seam (the decode-write's row-slots layout), ring_load back across it, and
+// the attention over the decoded rings against the FP64 oracle — which reads only the window's
+// slots, each holding the last position that wrote it.
+void case_ring(const char* name, mi::KvCoding key, mi::KvCoding value, double key_bound,
+               double value_bound, double attention_bound, std::mt19937& rng) {
+    constexpr int kRing = 64, kWindow = 24, kStage = 80;
+    const int key_code_bytes    = mi::kv_code_bytes(key);
+    const int key_scale_bytes   = mi::kv_scale_bytes(key);
+    const int value_code_bytes  = mi::kv_code_bytes(value);
+    const int value_scale_bytes = mi::kv_scale_bytes(value);
+    // Two sequences: a late decode step each and a verification run, every position past the
+    // seam (p % kRing wraps); the planes hold every position either sequence's window reaches.
+    const std::vector<std::pair<int, int>> rows{{0, 55}, {0, 66}, {1, 130}, {1, 131}, {1, 132}};
+    int lo = kRing, hi = 0;
+    for (const auto& [s, p] : rows) {
+        lo = std::min(lo, p - kWindow + 1);
+        hi = std::max(hi, p);
+    }
+    lo = std::max(0, lo);
+    const int sequences = 2, count = hi - lo + 1;
+    const std::size_t plane_values = std::size_t(sequences) * kKv * kRing;
+
+    // The planes' contents: Gaussian halves per (sequence, head, slot), of which the positions
+    // [lo, hi] of each sequence are stored (a store per sequence, rows in its fill order).
+    std::vector<__half> ks(plane_values * kD), vs(plane_values * kD);
+    {
+        std::normal_distribution<float> n(0.0f, 1.0f);
+        for (auto& v : ks) { v = __float2half(1.5f * n(rng)); }
+        for (auto& v : vs) { v = __float2half(n(rng)); }
+    }
+    DeviceBuffer dkc(plane_values * key_code_bytes), dks(plane_values * key_scale_bytes),
+                 dvc(plane_values * value_code_bytes), dvs(plane_values * value_scale_bytes);
+    const auto plane = [&](DeviceBuffer& codes, DeviceBuffer& scales, int cb, int sb,
+                           mi::KvCoding coding) {
+        mi::KvPlaneView view;
+        view.codes      = static_cast<std::uint8_t*>(codes.p);
+        view.scales     = static_cast<std::uint8_t*>(scales.p);
+        view.code_row   = cb;
+        view.scale_row  = sb;
+        view.code_head  = std::int64_t(kRing) * cb;
+        view.scale_head = std::int64_t(kRing) * sb;
+        view.code_seq   = view.code_head * kKv;
+        view.scale_seq  = view.scale_head * kKv;
+        view.coding     = coding;
+        return view;
+    };
+    {
+        // src: kv_post's row-slots layout for the fill ([kKv][count][128] halves), one store of
+        // sequence s's rows at positions [lo, hi] into its ring slots.
+        const auto store_fill = [&](const std::vector<__half>& all, int s, DeviceBuffer& codes,
+                                    DeviceBuffer& scales, int cb, int sb, mi::KvCoding coding) {
+            std::vector<__half> src(std::size_t(kKv) * count * kD);
+            for (int h = 0; h < kKv; ++h) {
+                for (int i = 0; i < count; ++i) {
+                    const std::size_t slot = std::size_t(lo + i) % kRing;
+                    for (int d = 0; d < kD; ++d) {
+                        src[(std::size_t(h) * count + i) * kD + d] =
+                            all[(std::size_t(s) * kKv + h) * kRing * kD + slot * kD + d];
+                    }
+                }
+            }
+            DeviceBuffer dsrc = upload(src);
+            RowsCase rc;
+            for (int i = 0; i < count; ++i) {
+                rc.positions.push_back(lo + i);
+                rc.sequences.push_back(s);
+            }
+            RowsDevice rows_dev(rc);
+            k::KvStoreArgs args;
+            args.rows            = rows_dev.rows;
+            args.src             = as<__half>(dsrc);
+            args.src_head_stride = std::int64_t(count) * kD;
+            args.dst_ring        = kRing;
+            args.rows_count      = count;
+            args.heads           = kKv;
+            args.dst             = plane(codes, scales, cb, sb, coding);
+            k::kv_store(args, nullptr);
+        };
+        store_fill(ks, 0, dkc, dks, key_code_bytes, key_scale_bytes, key);
+        store_fill(vs, 0, dvc, dvs, value_code_bytes, value_scale_bytes, value);
+        store_fill(ks, 1, dkc, dks, key_code_bytes, key_scale_bytes, key);
+        store_fill(vs, 1, dvc, dvs, value_code_bytes, value_scale_bytes, value);
+        check(cudaDeviceSynchronize(), "kv_store ring fill");
+    }
+
+    // The stored rows, decoded on the host from their downloaded codes and scales.
+    const auto k_codes  = download<std::uint8_t>(dkc, plane_values * key_code_bytes);
+    const auto k_scales = download<std::uint8_t>(dks, plane_values * key_scale_bytes);
+    const auto v_codes  = download<std::uint8_t>(dvc, plane_values * value_code_bytes);
+    const auto v_scales = download<std::uint8_t>(dvs, plane_values * value_scale_bytes);
+    const auto decode = [&](bool is_key, int s, int head, int slot) {
+        const std::size_t base = (std::size_t(s) * kKv + std::size_t(head)) * kRing + slot;
+        if (is_key) {
+            return decode_plane_row(key, k_codes.data() + base * key_code_bytes,
+                                    k_scales.data() + base * key_scale_bytes);
+        }
+        return decode_plane_row(value, v_codes.data() + base * value_code_bytes,
+                                v_scales.data() + base * value_scale_bytes);
+    };
+
+    // The stores: each fill position's decoded rows stay near its halves, across the seam.
+    Error ek, ev;
+    for (int s = 0; s < sequences; ++s) {
+        for (int p = lo; p <= hi; ++p) {
+            const int slot = p % kRing;
+            for (int h = 0; h < kKv; ++h) {
+                const auto kd = decode(true, s, h, slot), vd = decode(false, s, h, slot);
+                const std::size_t at = (std::size_t(s) * kKv + h) * kRing * kD +
+                                       std::size_t(slot) * kD;
+                for (int d = 0; d < kD; ++d) {
+                    ek.add(kd[d], __half2float(ks[at + d]));
+                    ev.add(vd[d], __half2float(vs[at + d]));
+                }
+            }
+        }
+    }
+    report(ek.rel() < key_bound && ev.rel() < value_bound,
+           std::string(name) + " ring kv_store round-trip: k " + num(ek.rel()) + ", v " +
+               num(ev.rel()) + " (bounds " + num(key_bound) + "/" + num(value_bound) + ")");
+
+    // ring_load across the seam: one sequence's rows [begin, end), decoded as halves into an F16
+    // staging ring (positions land at p % kStage, no wrap there — the window is below the ring).
+    {
+        const int begin = hi - 2 * kWindow, end = hi + 1;
+        DeviceBuffer dst_k(std::size_t(kKv) * kStage * kD * 2), dst_v(dst_k.bytes);
+        k::RingLoadArgs load;
+        load.src_k = plane(dkc, dks, key_code_bytes, key_scale_bytes, key);
+        load.src_v = plane(dvc, dvs, value_code_bytes, value_scale_bytes, value);
+        load.dst_k = as<__half>(dst_k);
+        load.dst_v = as<__half>(dst_v);
+        load.dst_head_stride = std::int64_t(kStage) * kD;
+        load.src_ring  = kRing;
+        load.dst_ring  = kStage;
+        load.kv_heads  = kKv;
+        load.begin     = begin;
+        load.end       = end;
+        load.sequence  = 1;
+        k::ring_load(load, nullptr);
+        check(cudaDeviceSynchronize(), "ring_load");
+        const auto got_k = download<__half>(dst_k, std::size_t(kKv) * kStage * kD);
+        const auto got_v = download<__half>(dst_v, std::size_t(kKv) * kStage * kD);
+        Error el;
+        for (int p = begin; p < end; ++p) {
+            const int slot = p % kStage;
+            for (int h = 0; h < kKv; ++h) {
+                const auto kd = decode(true, 1, h, p % kRing);
+                const auto vd = decode(false, 1, h, p % kRing);
+                for (int d = 0; d < kD; ++d) {
+                    el.add(__half2float(got_k[(std::size_t(h) * kStage + slot) * kD + d]), kd[d]);
+                    el.add(__half2float(got_v[(std::size_t(h) * kStage + slot) * kD + d]), vd[d]);
+                }
+            }
+        }
+        report(el.rel() < 2.0e-3, std::string(name) + " ring_load seam decode: " + num(el.rel()) +
+                                      " (bound 2e-3: the halves' rounding of the same products)");
+    }
+
+    // The attention over the ring planes against the FP64 oracle: the window's keys only, each
+    // at its slot p % kRing; a decode row's split sweep and the verification run.
+    const int group = kHeads / kKv;
+    for (int splits : {1, 9}) {
+        std::vector<int> positions, seqs;
+        for (const auto& [s, p] : rows) {
+            positions.push_back(p);
+            seqs.push_back(s);
+        }
+        RowsCase rc{positions, seqs, false, 0, 0, {}};
+        RowsDevice rows_dev(rc);
+        const auto q     = normal(std::size_t(rows.size()) * kHeads * kD, 0.6f, rng);
+        const auto r     = normal(std::size_t(rows.size()) * kHeads * kRel, 1.0f, rng);
+        const auto table = normal(std::size_t(kExtent) * kRel, 1.0f, rng);
+        const std::int64_t gate_stride = kHeads * kD + 32, sink_stride = kHeads + 3;
+        const auto gate  = normal(std::size_t(rows.size()) * gate_stride, 1.0f, rng);
+        const auto sinks = normal(std::size_t(rows.size()) * sink_stride, 2.0f, rng);
+        const float scale = 1.0f / std::sqrt(float(kD));
+        DeviceBuffer dq = upload(q), dr = upload(r), dt = upload(table), dg = upload(gate),
+                     ds = upload(sinks),
+                     partial(k::attention_workspace_floats(int(rows.size()), kHeads, splits) * 4),
+                     out(std::size_t(rows.size()) * kHeads * kD * 2);
+        k::AttentionArgs a;
+        a.rows        = rows_dev.rows;
+        a.q           = as<float>(dq);
+        a.r           = as<float>(dr);
+        a.sinks       = as<float>(ds);
+        a.sink_stride = sink_stride;
+        a.table       = as<float>(dt);
+        a.extent      = kExtent;
+        a.k_plane     = plane(dkc, dks, key_code_bytes, key_scale_bytes, key);
+        a.v_plane     = plane(dvc, dvs, value_code_bytes, value_scale_bytes, value);
+        a.ring        = kRing;
+        a.window      = kWindow;
+        a.query_heads = kHeads;
+        a.kv_heads    = kKv;
+        a.scale       = scale;
+        a.splits      = splits;
+        a.partial     = as<float>(partial);
+        a.gate        = as<float>(dg);
+        a.gate_stride = gate_stride;
+        a.out         = as<bf16>(out);
+        k::attention(a, nullptr);
+        check(cudaDeviceSynchronize(), "ring attention");
+        const auto got = download<bf16>(out, std::size_t(rows.size()) * kHeads * kD);
+        if (std::getenv("KV_DBG")) {
+            for (std::size_t x = 0; x < got.size(); ++x) {
+                if (std::isnan(__bfloat162float(got[x]))) {
+                    std::fprintf(stderr, "DBG ring first nan at %zu (row %zu head %zu dim %zu)\n",
+                                 x, x / (kHeads * kD), (x / kD) % kHeads, x % kD);
+                    break;
+                }
+            }
+            for (int x = 0; x < 8; ++x) {
+                std::fprintf(stderr, "DBG ring got[%d] = %g\n", x,
+                             __bfloat162float(got[std::size_t(x)]));
+            }
+            std::fprintf(stderr, "DBG ring rows: t=%d splits=%d ring=%d window=%d\n", a.rows.tokens,
+                         splits, a.ring, a.window);
+        }
+
+        Error eb;
+        int biased = 0;
+        for (std::size_t row = 0; row < rows.size(); ++row) {
+            const auto [s, p] = rows[row];
+            for (int h = 0; h < kHeads; ++h) {
+                const int kv = h / group;
+                const float* qh = q.data() + (row * kHeads + h) * kD;
+                const float* rh = r.data() + (row * kHeads + h) * kRel;
+                std::vector<double> score;
+                std::vector<std::vector<double>> vals;
+                const double sink = sinks[row * sink_stride + h];
+                double m = sink;
+                for (int j = std::max(0, p - kWindow + 1); j <= p; ++j) {
+                    const int distance = p - j;
+                    double d = 0;
+                    for (int i = 0; i < kD; ++i) {
+                        d += double(qh[i]) * scale * decode(true, s, kv, j % kRing)[i];
+                    }
+                    if (distance < kExtent) {
+                        for (int i = 0; i < kRel; ++i) {
+                            d += double(rh[i]) * table[std::size_t(distance) * kRel + i];
+                        }
+                        ++biased;
+                    }
+                    score.push_back(d);
+                    vals.emplace_back(decode(false, s, kv, j % kRing));
+                    m = std::max(m, d);
+                }
+                double l = std::exp(sink - m);
+                for (auto& v : score) { l += (v = std::exp(v - m)); }
+                for (int i = 0; i < kD; ++i) {
+                    double o = 0;
+                    for (std::size_t j = 0; j < score.size(); ++j) {
+                        o += score[j] * vals[j][i];
+                    }
+                    o = o / l * sigmoid(gate[row * gate_stride + h * kD + i]);
+                    eb.add(__bfloat162float(got[(row * kHeads + h) * kD + i]), o);
+                }
+            }
+        }
+        report(eb.rel() < attention_bound,
+               std::string(name) + " ring attention (splits " + std::to_string(splits) + ", " +
+                   std::to_string(biased) + " biased scores): " + num(eb.rel()) + " (bound " +
+                   num(attention_bound) + ")");
+    }
+}
+
+
 } // namespace
 
 int main() {
@@ -488,7 +763,11 @@ int main() {
             case_run(name, key, value, verify, 4, key_bound, value_bound, attention_bound, rng);
             case_run(name, key, value, chunk, 1, key_bound, value_bound, attention_bound, rng);
             case_run(name, key, value, branches, 1, key_bound, value_bound, attention_bound, rng);
+<<<<<<< HEAD
             case_run(name, key, value, far_chunk, 1, key_bound, value_bound, attention_bound, rng, true);
+=======
+            case_ring(name, key, value, key_bound, value_bound, attention_bound, rng);
+>>>>>>> inkling2-paged-tuning
         }
         std::cout << (failures == 0 ? "OK" : "FAIL") << " Inkling 2 KV planes\n";
         return failures == 0 ? 0 : 1;

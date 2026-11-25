@@ -1,4 +1,5 @@
 #include "runtime/engine/inkling2_core.h"
+#include "runtime/engine/kv_queue_policy.h"
 
 #include "artifact/formats.h"
 #include "artifact/reader.h"
@@ -252,7 +253,16 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
     executor.sequences     = std::clamp<std::uint32_t>(options.max_concurrency, 1, 8);
     executor.cuda_graphs   = options.use_cuda_graph;
     executor.kv_cache      = options.kv_cache;
+<<<<<<< HEAD
     executor.loop_kv       = options.loop_kv;
+=======
+    executor.paged_kv      = options.kv_paging;
+    executor.paged_kv_dedup = options.kv_page_dedup;
+    if (options.kv_paging && options.kv_page_budget_mib != 0) {
+        executor.paged_kv_budget_bytes = std::uint64_t(options.kv_page_budget_mib) << 20;
+    }
+    executor.paged_kv_page_tokens = options.kv_page_group;
+>>>>>>> inkling2-paged-tuning
     executor.draft_tokens  = dspine ? speculative.draft_tokens : lookup_drafts;
     executor.dspine        = dspine;
     executor.dspark        = dspark;
@@ -335,7 +345,10 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
                        executor.sequences, executor.prefill_chunk, kv_name,
                        double(instance->executor->memory().kv_bytes) / 1048576.0,
                        instance->executor->memory().kv_grows
-                           ? " at most, growing with the sequences beside an elastic expert cache"
+                           ? (executor.paged_kv
+                                  ? " at most, growing with the sequences in the page pool"
+                                  : " at most, growing with the sequences beside an elastic "
+                                    "expert cache")
                            : "",
                        double(instance->executor->memory().workspace_bytes) / 1048576.0);
     if (executor.loop_kv != LoopKvCache::PerPass) {
@@ -658,7 +671,23 @@ struct Inkling2Core::Impl {
     // --draft-min-p: a drafter's round verifies through its first draft at or below this
     // probability.
     const float draft_floor;
+<<<<<<< HEAD
     // --adaptive-mtp with a block drafter: the drafts of a lone request's round, from how far its
+=======
+    // --kv-reserve-mode chunked + --kv-reserve-gen-chunk: admission grants prompt + the first
+    // chunk of generation pages and the grant grows per decode round; a lane whose extension
+    // cannot be granted fails its own request while the server keeps serving.
+    // --kv-queue-order shortest: admission picks the smallest queued request first.
+    const bool reserve_chunked;
+    const std::uint32_t reserve_gen_chunk;
+    const bool shortest_queue;
+    // The chunk clamped to the widest decode round: a verify round commits up to drafts + 1
+    // rows plus its anchor, so a smaller chunk would let a round outrun the grant.
+    [[nodiscard]] auto reserve_chunk_for(std::uint32_t tokens) const {
+        return std::max(tokens, std::max(drafts + 2U, 1U));
+    }
+    // --adaptive-mtp with --spec dspark: the drafts of a lone request's round, from how far its
+>>>>>>> inkling2-paged-tuning
     // drafts survive and the round times measured at each width; and the width of the round
     // running (0 when it is not the controller's).
     std::optional<runtime::MtpAdaptiveBatchController> block_controller;
@@ -747,6 +776,9 @@ struct Inkling2Core::Impl {
                                                                : i.executor->block_drafts()),
           block_width(i.executor->block_drafts() + 1),
           draft_floor(options.speculative.draft_min_p.value_or(0.0F)),
+          reserve_chunked(options.kv_reserve_mode == KvReserveMode::Chunked),
+          reserve_gen_chunk(options.kv_reserve_gen_chunk),
+          shortest_queue(options.kv_queue_order == KvQueueOrder::Shortest),
           diagnostics(options.diagnostic_observer),
           slots(i.executor->options().sequences),
           decode_rounds_per_prefill(
@@ -1086,9 +1118,14 @@ struct Inkling2Core::Impl {
             }
             bool worked = true;
             try {
+<<<<<<< HEAD
                 // An admitted prompt shows as running while its first step computes, which
                 // can take as long as the whole prompt.
                 if (admit()) { publish_stats(); }
+=======
+                precheck_reservations();
+                admit();
+>>>>>>> inkling2-paged-tuning
                 worked = step();
                 check_progress();
             } catch (...) { fail_engine(std::current_exception()); }
@@ -1383,22 +1420,76 @@ struct Inkling2Core::Impl {
                         prefix_reuse(slot.anchor, slot.anchor_media, prompt));
     }
 
+<<<<<<< HEAD
     // Moves queued requests into free sequences; returns whether a request left the queue.
     bool admit() {
         bool moved = false;
+=======
+    // --kv-reserve-mode chunked: every decoding lane's grant grows per decode round, before
+    // new admissions take from the pool (extensions outrank admissions). A lane whose
+    // extension cannot be granted fails its own request with a clean 503 while the server and
+    // the other lanes keep serving; when its remaining budget fits the extension, the grant
+    // covers the request to completion, so the final stretch never straddles one.
+    void precheck_reservations() {
+        if (!reserve_chunked || !instance.executor->paged_kv()) { return; }
+        for (std::uint32_t s = 0; s < slots.size(); ++s) {
+            const std::shared_ptr<Request> request = slots[s].request;
+            if (!request || !request->decoding) { continue; }
+            if (request->cancelled.load(std::memory_order_acquire)) { continue; }
+            const std::uint32_t remaining =
+                request->budget ? request->budget->remaining() : 0U;
+            const std::uint32_t needed = kv_queue::extension_target_tokens(
+                request->position, remaining, reserve_chunk_for(reserve_gen_chunk));
+            if (!instance.executor->reserve_pages(s, needed)) {
+                fail(request, std::make_exception_ptr(
+                                  RequestError(RequestErrorKind::Unavailable,
+                                               "the page pool cannot extend this request's "
+                                               "generation reservation; the server is at its "
+                                               "page budget",
+                                               kv_queue::retry_after_seconds(1000))));
+            }
+        }
+    }
+
+    void admit() {
+>>>>>>> inkling2-paged-tuning
         for (;;) {
             std::optional<std::uint32_t> best;
             std::shared_ptr<Request> request;
             {
                 std::lock_guard lock(queue_mutex);
+<<<<<<< HEAD
                 if (pending.empty()) { return moved; }
+=======
+                if (pending.empty()) { return; }
+                // The admission order: fifo (the default) serves the longest-waiting request;
+                // shortest picks the smallest prompt + max_tokens first, so a saturated server
+                // keeps completing work instead of blocking behind one huge prompt.
+                std::size_t pick = 0;
+                if (shortest_queue) {
+                    std::uint64_t best_cost = UINT64_MAX;
+                    for (std::size_t i = 0; i < pending.size(); ++i) {
+                        const Request& candidate = *pending[i];
+                        const auto n = std::uint32_t(candidate.prompt_tokens.size());
+                        const std::uint64_t cost =
+                            std::uint64_t(n) +
+                            effective_output_capacity(
+                                candidate.options.execution.requested_output_tokens, max_context,
+                                n);
+                        if (cost < best_cost) {
+                            best_cost = cost;
+                            pick      = i;
+                        }
+                    }
+                }
+>>>>>>> inkling2-paged-tuning
                 for (std::uint32_t s = 0; s < slots.size(); ++s) {
                     if (slots[s].request) { continue; }
                     if (!best) {
                         best = s;
                         continue;
                     }
-                    const Request& prompt = *pending.front();
+                    const Request& prompt = *pending[pick];
                     const auto candidate  = reuse(slots[s], prompt);
                     const auto current   = reuse(slots[*best], prompt);
                     if (candidate > current ||
@@ -1406,15 +1497,61 @@ struct Inkling2Core::Impl {
                         best = s;
                     }
                 }
+<<<<<<< HEAD
                 if (!best) { return moved; }
                 request = std::move(pending.front());
                 pending.pop_front();
                 moved = true;
+=======
+                if (!best) { return; }
+                // The queue deadline applies to a request the pool cannot hold, too: it is
+                // completed with the timeout rather than waiting behind the check forever.
+                if (Clock::now() > pending[pick]->deadline) {
+                    request = std::move(pending[pick]);
+                    pending.erase(pending.begin() + static_cast<std::ptrdiff_t>(pick));
+                } else {
+                    // --kv-paging: the request's pages must fit beside the other lanes' grants.
+                    // The idle lane's own pages, held since its last request, go to the store
+                    // and back to the pool first when the prompt does not continue them; what
+                    // still does not fit waits in the queue instead of failing mid-flight.
+                    if (instance.executor->paged_kv()) {
+                        Slot& chosen = slots[*best];
+                        const auto& head = *pending[pick];
+                        const auto prompt_n = std::uint32_t(head.prompt_tokens.size());
+                        const std::uint32_t output = effective_output_capacity(
+                            head.options.execution.requested_output_tokens, max_context,
+                            prompt_n);
+                        const std::uint32_t full = prompt_n + output;
+                        // Chunked admission first asks for the whole grant: when the pool
+                        // holds it the lane never extends, and only a tight pool falls back
+                        // to the first generation chunk.
+                        const std::uint32_t tokens = kv_queue::generation_grant_tokens(
+                            prompt_n, output,
+                            reserve_chunked ? reserve_chunk_for(reserve_gen_chunk) : 0U);
+                        bool fits = instance.executor->reserve_pages(*best, full);
+                        if (!fits && tokens != full) {
+                            fits = instance.executor->reserve_pages(*best, tokens);
+                        }
+                        if (!fits && reuse(chosen, head) == 0) {
+                            if (reuse_prefixes) { retire(*best); }
+                            instance.executor->reset(*best);
+                            fits = instance.executor->reserve_pages(*best, tokens);
+                        }
+                        if (!fits) { return; }
+                    }
+                    request = std::move(pending[pick]);
+                    pending.erase(pending.begin() + static_cast<std::ptrdiff_t>(pick));
+                }
+>>>>>>> inkling2-paged-tuning
             }
             if (Clock::now() > request->deadline) {
+                const auto left = request->deadline - Clock::now();
+                const std::uint32_t retry_after = kv_queue::retry_after_seconds(
+                    left.count() > 0 ? std::uint64_t(left.count()) : 0U);
                 complete(request, std::make_exception_ptr(
                                       RequestError(RequestErrorKind::QueueTimeout,
-                                                   "inference request expired in the queue")));
+                                                   "inference request expired in the queue",
+                                                   retry_after)));
                 continue;
             }
             try {
@@ -1492,6 +1629,21 @@ struct Inkling2Core::Impl {
             slot.anchor.clear();
             slot.media.clear();
             slot.anchor_media.clear();
+            // reset() released the lane's grant with its pages: re-place this request's, so it
+            // runs covered and a pool that cannot hold it beside the other lanes refuses here,
+            // at planning, rather than mid-flight.
+            if (executor.paged_kv() &&
+                !executor.reserve_pages(s, kv_queue::generation_grant_tokens(
+                                               prompt_n,
+                                               effective_output_capacity(
+                                                   r.options.execution.requested_output_tokens,
+                                                   max_context, prompt_n),
+                                               reserve_chunked
+                                                   ? reserve_chunk_for(reserve_gen_chunk)
+                                                   : 0U))) {
+                throw RequestError(RequestErrorKind::ContextLengthExceeded,
+                                   "the page pool cannot hold the request beside the others");
+            }
         }
         slot.request    = request;
         slot.last_used  = ++use_clock;
@@ -3443,8 +3595,20 @@ MemorySummary Inkling2Core::memory_summary() const {
     out.device      = impl_->device.rank(0).device;
     out.max_context = impl_->max_context;
     out.kv_capacity = impl_->max_context;
+<<<<<<< HEAD
     out.kv_cache    = impl_->kv_cache;
     out.host_kv_capacity_bytes = impl_->store.host_budget();
+=======
+    out.kv_cache    = impl_->kv_cache; // F16 rows either way
+    // --kv-paging: the pool's page groups, in use and at capacity.
+    out.kv_capacity_page_groups     = memory.kv_pages;
+    out.kv_capacity_max_page_groups = memory.kv_pages_max;
+    out.kv_shared_page_groups       = memory.kv_pages_shared;
+    out.kv_dedup_hits               = memory.kv_dedup_hits;
+    out.kv_dedup_offers             = memory.kv_dedup_offers;
+    out.kv_dedup_collisions         = memory.kv_dedup_collisions;
+    out.host_kv_capacity_bytes = impl_->host_budget;
+>>>>>>> inkling2-paged-tuning
     {
         std::lock_guard lock(impl_->stats_mutex);
         out.host_kv_occupied_bytes = impl_->stats.host_kv_occupied_bytes;
