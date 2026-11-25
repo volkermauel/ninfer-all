@@ -5,15 +5,10 @@
 //    rows stored (a coding's own error bound); MXFP8's codes and scales equal the release's rule
 //    (vLLM's mxfp8_quantize) applied on the host, bit for bit;
 //  - attention over the planes: a full-attention visit's decode rows, verification rows, prompt
-<<<<<<< HEAD
 //    chunk, branches and a chunk with a far field against an FP64 attention over the host-decoded
-//    rows, the slots being the rows' physical positions.
-=======
-//    chunk and branches against an FP64 attention over the host-decoded rows, the slots being the
-//    rows' physical positions;
+//    rows, the slots being the rows' physical positions;
 //  - a sliding visit's ring of the same planes: stores and loads across the wrap-around seam and
 //    the windowed attention over the decoded ring (the slot of a key at position p is p % ring).
->>>>>>> inkling2-paged-tuning
 
 #include "../../ops/kv_cache_lloyd4_oracle.h"
 #include "core/device_buffer.h"
@@ -763,11 +758,9 @@ int main() {
             case_run(name, key, value, verify, 4, key_bound, value_bound, attention_bound, rng);
             case_run(name, key, value, chunk, 1, key_bound, value_bound, attention_bound, rng);
             case_run(name, key, value, branches, 1, key_bound, value_bound, attention_bound, rng);
-<<<<<<< HEAD
             case_run(name, key, value, far_chunk, 1, key_bound, value_bound, attention_bound, rng, true);
-=======
             case_ring(name, key, value, key_bound, value_bound, attention_bound, rng);
->>>>>>> inkling2-paged-tuning
+
         }
         std::cout << (failures == 0 ? "OK" : "FAIL") << " Inkling 2 KV planes\n";
         return failures == 0 ? 0 : 1;

@@ -5,15 +5,12 @@
 #include "core/device_wait.h"
 #include "core/expert_parallel.h"
 #include "core/growable_region.h"
-<<<<<<< HEAD
 #include "core/mapped_host_copy.h"
 #include "core/pdl_scope.h"
-=======
 #include "core/paged_kv_cache.h"
 #include "core/paged_kv_page.h"
 #include "models/inkling2/page_dedup.h"
 #include "core/host_kv_arena.h"
->>>>>>> inkling2-paged-tuning
 #include "core/pinned_memory.h"
 #include "core/qtype.h"
 #include "core/tensor_parallel.h"
@@ -170,16 +167,11 @@ struct VisitPlan {
     bool restart      = false; // the core's first visit of a later pass
     bool control      = false; // a later pass's core visit
     bool start        = false; // the layer starts a residual block
-<<<<<<< HEAD
     // The visit whose caches this one reads and writes (--loop-kv: a core layer's last pass), or
     // -1: its own. A visit that uses another's owns no caches or checkpoint.
     int store = -1;
     // The F16 K and V caches: [sequences][kv heads][slots][D]. A quantized full visit has none;
     // its rows live in its code and scale planes.
-=======
-    // The F16 K and V caches: [sequences][kv heads][slots][D]. A quantized visit has none; its
-    // rows live in its code and scale planes.
->>>>>>> inkling2-paged-tuning
     KvArea k, v;
     // The quantized planes' codes and scales (a visit of a quantized run): the same
     // [sequences][kv heads][slots] addressing, one row of codes and one of scales per slot.
@@ -584,17 +576,13 @@ struct Executor::Impl {
             p.head_stride  = std::int64_t(p.slots) * kD;
             p.seq_stride   = p.head_stride * kv_heads;
             const bool grows = growing && p.full;
-<<<<<<< HEAD
             if (p.store >= 0) {
                 visits.push_back(std::move(p));
                 continue;
             }
-            if (p.full && kvfmt.quantized()) {
-=======
             if (p.full && paged) {
                 p.pool_plane = 4 * full_visits++; // the pool holds the visit's four planes
             } else if (kvfmt.quantized()) {
->>>>>>> inkling2-paged-tuning
                 // One code and one scale area per plane; a row is one head's whole block of
                 // slots (the F16 caches' row shape), position_bytes one slot's codes or scales.
                 // A full visit's planes grow with the sequence, a sliding visit's ring is fixed.
@@ -684,11 +672,7 @@ struct Executor::Impl {
         logits_bf16 = DeviceBuffer(std::size_t(vocab) * kMaxLogitRows * 2);
         if (options.dspark) { plan_spark(device_id, sequences); }
         for (VisitPlan& p : visits) {
-<<<<<<< HEAD
-            if (!p.full || p.store >= 0) { continue; }
-=======
-            if (!p.full || paged) { continue; } // paged: the pool holds the full visits
->>>>>>> inkling2-paged-tuning
+            if (!p.full || paged || p.store >= 0) { continue; }
             if (p.k_codes.p != nullptr) {
                 for (KvArea* area : {&p.k_codes, &p.k_scales, &p.v_codes, &p.v_scales}) {
                     sequence_areas.push_back(area);
@@ -2752,7 +2736,6 @@ struct Executor::Impl {
         }
         auto* q = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * q_floats * 4).data);
         auto* r = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * query_heads * rel * 4).data);
-<<<<<<< HEAD
         kernels::QueryArgs qa;
         qa.qgr             = qgr;
         qa.stride          = lp.query_rows;
@@ -2776,56 +2759,9 @@ struct Executor::Impl {
         // one of rk8v4 or rk4v4 stages them as F16 (one slot per row) for kv_store to encode.
         // The caches are the visit's own, or (--loop-kv) the core's last pass's (`kvp`).
         const VisitPlan& kvp = vp.store >= 0 ? visits[std::size_t(vp.store)] : vp;
-=======
-        {
-            kernels::QueryArgs qa;
-            qa.qgr             = qgr;
-            qa.stride          = lp.query_rows;
-            qa.relative_column = 2 * q_floats;
-            qa.tokens          = t;
-            qa.heads           = query_heads;
-            qa.query_clip      = lp.query_clip;
-            qa.relative_clip   = lp.relative_clip;
-            qa.qk_clip         = config.qk_clip;
-            qa.rel_clip        = config.relative_clip;
-            qa.log_scale       = lp.full;
-            qa.alpha           = config.log_scale_alpha;
-            qa.floor           = float(config.log_scale_floor);
-            qa.positions       = c.rows.positions;
-            qa.q_out           = q;
-            qa.r_out           = r;
-            kernels::query_post(qa, stream);
-        }
-        // K and V into the cache: a prompt chunk's sliding visit attends over the staging ring
-        // (the window before the chunk comes over from the sequence's ring, the chunk's keys land
-        // there, and the window that ends the chunk's kept rows goes back). A quantized visit
-        // stages its rows as F16 (one slot per row) for kv_store to encode into its planes; a
-        // quantized sliding visit's chunk decodes the window from its ring planes into the
-        // staging (ring_load) and encodes the kept rows back into them.
->>>>>>> inkling2-paged-tuning
         const std::int64_t stage_stride = std::int64_t(prefill_ring) * kD;
         const std::int64_t seq_offset   = std::int64_t(c.sequence) * kvp.seq_stride;
         const bool staging   = c.chunk && !vp.full;
-<<<<<<< HEAD
-        const bool quantized = vp.full && kvfmt.quantized();
-        KvPlaneView k_view, v_view; // a quantized full visit's planes, else null codings
-        if (quantized) {
-            const auto view = [&](const KvArea& codes, const KvArea& scales, KvCoding coding) {
-                KvPlaneView plane;
-                plane.codes   = static_cast<std::uint8_t*>(codes.p);
-                plane.scales  = static_cast<std::uint8_t*>(scales.p);
-                plane.code_row  = kv_code_bytes(coding);
-                plane.scale_row = kv_scale_bytes(coding);
-                plane.code_head  = std::int64_t(kvp.slots) * plane.code_row;
-                plane.scale_head = std::int64_t(kvp.slots) * plane.scale_row;
-                plane.code_seq  = plane.code_head * kv_heads;
-                plane.scale_seq = plane.scale_head * kv_heads;
-                plane.coding    = coding;
-                return plane;
-            };
-            k_view = view(kvp.k_codes, kvp.k_scales, kvfmt.key.coding);
-            v_view = view(kvp.v_codes, kvp.v_scales, kvfmt.value.coding);
-=======
         const bool quantized = kvfmt.quantized();
         // The visit's planes (quantized only): what kv_store encodes into, ring_load decodes from
         // and the attention reads (a sliding visit's chunk reads the F16 staging instead).
@@ -2859,9 +2795,8 @@ struct Executor::Impl {
             return plane;
         };
         if (quantized) {
-            k_view = view(vp.k_codes, vp.k_scales, kvfmt.key.coding, vp.pool_plane);
-            v_view = view(vp.v_codes, vp.v_scales, kvfmt.value.coding, vp.pool_plane + 2);
->>>>>>> inkling2-paged-tuning
+            k_view = view(kvp.k_codes, kvp.k_scales, kvfmt.key.coding, vp.pool_plane);
+            v_view = view(kvp.v_codes, kvp.v_scales, kvfmt.value.coding, vp.pool_plane + 2);
         }
         kernels::RingCopyArgs keep;
         keep.kv_heads = kv_heads;
@@ -2880,14 +2815,10 @@ struct Executor::Impl {
         ka.kv_heads    = kv_heads;
         ka.qk_clip     = config.qk_clip;
         ka.eps         = eps;
-<<<<<<< HEAD
-        if (quantized && kvfmt.mxfp8()) {
+        if (quantized && (kvfmt.mxfp8() || !staging)) {
             ka.k_plane = k_view;
             ka.v_plane = v_view;
         } else if (quantized) {
-=======
-        if (quantized && !staging) {
->>>>>>> inkling2-paged-tuning
             auto* stage = static_cast<__half*>(workspace->alloc_bytes(std::size_t(t) * 2 * kvd * 2).data);
             ka.k_cache     = stage;
             ka.v_cache     = stage + std::size_t(t) * kvd;
@@ -2897,7 +2828,6 @@ struct Executor::Impl {
             ka.ring        = vp.ring;
             ka.row_slots   = true;
         } else if (staging) {
-<<<<<<< HEAD
             keep.src_k           = static_cast<const __half*>(kvp.k.p) + seq_offset;
             keep.src_v           = static_cast<const __half*>(kvp.v.p) + seq_offset;
             keep.dst_k           = static_cast<__half*>(staging_k.p);
@@ -2905,11 +2835,6 @@ struct Executor::Impl {
             keep.src_head_stride = kvp.head_stride;
             keep.dst_head_stride = stage_stride;
             keep.src_ring        = kvp.ring;
-=======
-            keep.dst_k           = static_cast<__half*>(staging_k.p);
-            keep.dst_v           = static_cast<__half*>(staging_v.p);
-            keep.dst_head_stride = stage_stride;
->>>>>>> inkling2-paged-tuning
             keep.dst_ring        = prefill_ring;
             keep.begin           = std::max(0, c.first - window);
             keep.end             = c.first;
@@ -2947,13 +2872,8 @@ struct Executor::Impl {
             ka.head_stride = kvp.head_stride;
             ka.ring        = kvp.ring;
         }
-<<<<<<< HEAD
         kernels::attention_inputs(qa, ka, stream);
         if (quantized && kvfmt.staged()) {
-=======
-        kernels::kv_post(ka, stream);
-        if (quantized && !staging) {
->>>>>>> inkling2-paged-tuning
             for (const auto& [src, plane] :
                  {std::pair{ka.k_cache, k_view}, std::pair{ka.v_cache, v_view}}) {
                 kernels::KvStoreArgs store;
@@ -3025,23 +2945,10 @@ struct Executor::Impl {
             aa.out_q       = attn_q.rows;
             kernels::attention(aa, stream);
         }
-<<<<<<< HEAD
         // A ring another pass shares takes back only the last pass's window: an earlier pass's
         // rows past position `first + kept - ring` would land in the slots of the window before
         // the chunk, which the next pass still copies in.
         if (staging && c.kept > 0 && vp.store < 0) {
-            kernels::RingCopyArgs back = keep;
-            std::swap(back.src_head_stride, back.dst_head_stride);
-            std::swap(back.src_ring, back.dst_ring);
-            back.src_k = static_cast<const __half*>(staging_k.p);
-            back.src_v = static_cast<const __half*>(staging_v.p);
-            back.dst_k = static_cast<__half*>(kvp.k.p) + seq_offset;
-            back.dst_v = static_cast<__half*>(kvp.v.p) + seq_offset;
-            back.begin = std::max(0, c.first + c.kept - window);
-            back.end   = c.first + c.kept;
-            kernels::ring_copy(back, stream);
-=======
-        if (staging && c.kept > 0) {
             const int back_begin = std::max(0, c.first + c.kept - window);
             const int back_end   = c.first + c.kept;
             if (quantized) {
@@ -3070,13 +2977,13 @@ struct Executor::Impl {
                 std::swap(back.src_ring, back.dst_ring);
                 back.src_k = static_cast<const __half*>(staging_k.p);
                 back.src_v = static_cast<const __half*>(staging_v.p);
-                back.dst_k = static_cast<__half*>(vp.k.p) + seq_offset;
-                back.dst_v = static_cast<__half*>(vp.v.p) + seq_offset;
+                back.dst_k = static_cast<__half*>(kvp.k.p) + seq_offset;
+                back.dst_v = static_cast<__half*>(kvp.v.p) + seq_offset;
                 back.begin = back_begin;
                 back.end   = back_end;
                 kernels::ring_copy(back, stream);
             }
->>>>>>> inkling2-paged-tuning
+        }
         }
         auto* y = static_cast<float*>(workspace->alloc_bytes(std::size_t(c.plane) * 4).data);
         product(lp.output, c.q8 ? attn_q.base : nullptr, attn, t, y, hidden);
@@ -3640,17 +3547,9 @@ struct Executor::Impl {
         }
         for (int j = 0; j < n; ++j) { back(sequences[j], positions[sequences[j]] + row_widths[j]); }
         stage(tokens, pos, seq);
-<<<<<<< HEAD
         // A full visit's attention reads each key tile once for up to four rows of a sequence.
         run_graph(16 + std::uint32_t(rows),
                   [&] { decode_body(rows, false, std::min(rows, kernels::kMaxRowGroup)); });
-=======
-        run_graph(16 + std::uint32_t(rows), [&] { decode_body(rows, false); });
-        for (int j = 0, at = 0; j < n; at += int(row_widths[j]), ++j) {
-            verify_stash[std::size_t(sequences[j])].assign(
-                tokens.begin() + at, tokens.begin() + at + int(row_widths[j]));
-        }
->>>>>>> inkling2-paged-tuning
         verify_widths = std::move(row_widths);
     }
 
@@ -3833,18 +3732,6 @@ struct Executor::Impl {
 
     [[nodiscard]] std::uint64_t image_bytes(std::uint32_t position) const {
         std::uint64_t bytes = sequence_history_bytes();
-<<<<<<< HEAD
-        for (const VisitPlan* p : cache_plans()) {
-            if (p->full && p->k_codes.p != nullptr) {
-                // A quantized visit's planes: per head, `position` slots of codes and scales.
-                for (const KvArea* area : {&p->k_codes, &p->k_scales, &p->v_codes, &p->v_scales}) {
-                    bytes += std::uint64_t(kv_heads) * position * area->position_bytes;
-                }
-            } else if (p->full) {
-                bytes += 2 * std::uint64_t(kv_heads) * position * kD * sizeof(__half);
-            } else {
-                for (const auto& r : ring_buffers(*p, 0)) { bytes += r.second; }
-=======
         if (paged) {
             // Whole page-group records, packed one after another across the host slices.
             const std::uint64_t groups =
@@ -3860,7 +3747,6 @@ struct Executor::Impl {
                 } else {
                     for (const auto& s : ring_spans(*p, 0)) { bytes += s.second; }
                 }
->>>>>>> inkling2-paged-tuning
             }
         }
         if (spark) { bytes += spark_context_bytes(); }
