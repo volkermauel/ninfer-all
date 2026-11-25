@@ -12,17 +12,13 @@
 namespace ninfer::models::inkling2::kernels {
 
 // Stores F16 rows into a quantized plane: row r's values, head h at src + h * src_head_stride +
-<<<<<<< HEAD
-// r * 128 (KvArgs's `row_slots` layout), head h's plane row of position physical(rows, r) at slot
-// physical(rows, r) (a full-attention visit: ring 0) of sequence row_sequence(rows, r).
-=======
-// r * 128 (kv_post's `row_slots` layout, the staging scratch), head h's plane row of position
-// physical(rows, r) at slot physical(rows, r) (a full-attention visit: ring 0) of sequence
-// row_sequence(rows, r). Without `src_row_slots` the rows come from a ring instead (slot
-// physical(rows, r) % src_ring, 0: physical — a staging ring's kept rows), `dst_ring` stores them
-// to a ring (a sliding visit's planes: slot physical(rows, r) % dst_ring), and [begin, end) keeps
+// Stores F16 rows into a quantized plane: row r's values, head h at src + h * src_head_stride +
+// r * 128 (KvArgs's `row_slots` layout, kv_post's staging scratch; without `src_row_slots` the
+// rows come from a ring instead, slot physical(rows, r) % src_ring, 0: physical — a staging
+// ring's kept rows), head h's plane row of position physical(rows, r) at slot physical(rows, r)
+// (a full-attention visit: ring 0) of sequence row_sequence(rows, r). `dst_ring` stores them to
+// a ring (a sliding visit's planes: slot physical(rows, r) % dst_ring), and [begin, end) keeps
 // the store to the rows whose physical positions lie in it (both 0: every row).
->>>>>>> inkling2-paged-tuning
 struct KvStoreArgs {
     Rows rows;
     const __half* src = nullptr;
